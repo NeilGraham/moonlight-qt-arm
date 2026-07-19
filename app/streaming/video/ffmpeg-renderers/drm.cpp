@@ -1949,6 +1949,49 @@ void DrmRenderer::renderFrame(AVFrame* frame)
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "COLOR_ENCODING property does not exist on video plane. Colors may be inaccurate!");
         }
+
+        // Rockchip vendor kernels (VOP2 BSP) don't implement the standard
+        // COLOR_ENCODING/COLOR_RANGE plane properties. The plane's YUV->RGB
+        // CSC matrix is instead selected by the vendor "COLOR_SPACE" property
+        // (V4L2 colorspace code; unset falls back to BT.709 limited) with PQ/
+        // HLG signalled via the vendor "EOTF" property. Without these,
+        // BT.2020 HDR streams get a BT.709 matrix and look washed out.
+        if (auto prop = m_VideoPlane.property("COLOR_SPACE")) {
+            uint64_t v4l2ColorSpace;
+
+            switch (getFrameColorspace(frame)) {
+            case COLORSPACE_REC_709:
+                v4l2ColorSpace = 3;  // V4L2_COLORSPACE_REC709
+                break;
+            case COLORSPACE_REC_2020:
+                v4l2ColorSpace = 10; // V4L2_COLORSPACE_BT2020
+                break;
+            case COLORSPACE_REC_601:
+            default:
+                v4l2ColorSpace = 1;  // V4L2_COLORSPACE_SMPTE170M
+                break;
+            }
+
+            m_PropSetter.set(*prop, v4l2ColorSpace);
+        }
+
+        if (auto prop = m_VideoPlane.property("EOTF")) {
+            uint64_t eotf;
+
+            switch (frame->color_trc) {
+            case AVCOL_TRC_SMPTE2084:
+                eotf = 2; // HDMI_EOTF_SMPTE_ST2084
+                break;
+            case AVCOL_TRC_ARIB_STD_B67:
+                eotf = 3; // HDMI_EOTF_BT_2100_HLG
+                break;
+            default:
+                eotf = 0; // HDMI_EOTF_TRADITIONAL_GAMMA_SDR
+                break;
+            }
+
+            m_PropSetter.set(*prop, eotf);
+        }
     }
 
     // Update the video plane
