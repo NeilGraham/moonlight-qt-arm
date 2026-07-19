@@ -134,6 +134,7 @@ int FFmpegVideoDecoder::getDecoderCapabilities()
                 {"hevc_omx", 0},
 
                 // AV1
+                {"av1_rkmpp", 0},
             };
 
             // We have a non-hwaccel hardware decoder. This will always
