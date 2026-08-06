@@ -2029,6 +2029,52 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
         }
 
+        // stability/stream: one machine-readable row per 1 s window.
+        //
+        // The on-screen overlay is for a human watching the TV, and the
+        // end-of-session dump only reports the average of a run that has
+        // already ended -- neither can tell a harness WHEN the stream went
+        // bad. This line can, and it carries a monotonic microsecond stamp so
+        // the row lands on the same timeline as the host-side counters after
+        // the clock-offset handshake.
+        //
+        // Format (see stability/stream/engine/judges/stream-judge.py):
+        //   ML-STATS-CSV,mono_us,recvFps,decFps,rendFps,netDropped,
+        //     pacerDropped,hostLatMin,hostLatMax,hostLatAvg,rtt,rttVar,
+        //     decodeMs,pacerMs,renderMs,mbps
+        {
+            VIDEO_STATS& s = m_ActiveWndVideoStats;
+            double secs = (LiGetMicroseconds() - s.measurementStartUs) / 1000000.0;
+            if (secs <= 0.0) {
+                secs = 1.0;
+            }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "ML-STATS-CSV,%llu,%.2f,%.2f,%.2f,%u,%u,%.1f,%.1f,%.2f,%u,%u,%.2f,%.2f,%.2f,%.2f",
+                        (unsigned long long)LiGetMicroseconds(),
+                        s.receivedFrames / secs,
+                        s.decodedFrames / secs,
+                        s.renderedFrames / secs,
+                        s.networkDroppedFrames,
+                        s.pacerDroppedFrames,
+                        // Host processing latency arrives over RTP in TENTHS
+                        // of a millisecond. Emit milliseconds like every other
+                        // column, so a reader never has to know that.
+                        s.minHostProcessingLatency / 10.0,
+                        s.maxHostProcessingLatency / 10.0,
+                        s.framesWithHostProcessingLatency
+                            ? (double)s.totalHostProcessingLatency / s.framesWithHostProcessingLatency / 10.0
+                            : 0.0,
+                        s.lastRtt,
+                        s.lastRttVariance,
+                        s.decodedFrames
+                            ? (double)s.totalDecodeTimeUs / s.decodedFrames / 1000.0 : 0.0,
+                        s.renderedFrames
+                            ? (double)s.totalPacerTimeUs / s.renderedFrames / 1000.0 : 0.0,
+                        s.renderedFrames
+                            ? (double)s.totalRenderTimeUs / s.renderedFrames / 1000.0 : 0.0,
+                        s.videoMegabitsPerSec);
+        }
+
         // Accumulate these values into the global stats
         addVideoStats(m_ActiveWndVideoStats, m_GlobalVideoStats);
 
