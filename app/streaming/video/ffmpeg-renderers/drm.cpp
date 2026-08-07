@@ -2003,6 +2003,14 @@ void DrmRenderer::renderFrame(AVFrame* frame)
     // order to keep those from being reused by the decoder while they're still being scanned out.
     m_PropSetter.flipPlane(m_VideoPlane, fbId, 0);
 
+    // Arm a writeback capture on this commit if one is due (Phase 5b:
+    // proves the pixels were actually composed and scanned out, which no
+    // decoder-side counter can).
+    if (m_PropSetter.wbDue() &&
+        m_PropSetter.wbPrepare(m_Crtc.objectId(), m_OutputRect.w, m_OutputRect.h)) {
+        m_PropSetter.wbArm();
+    }
+
     // Apply pending atomic transaction (if in atomic mode)
     m_PropSetter.apply();
 }

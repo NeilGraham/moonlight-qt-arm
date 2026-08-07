@@ -1,5 +1,10 @@
 #pragma once
 
+#include "../framebarcode.h"
+#include <drm_fourcc.h>
+#include <poll.h>
+#include <sys/mman.h>
+
 #include "renderer.h"
 #include "swframemapper.h"
 
@@ -266,12 +271,41 @@ class DrmRenderer : public IFFmpegRenderer {
             }
         }
 
+        // --- writeback capture state (Phase 5b; inert unless armed) ---
+        bool m_WbWanted = false;
+        bool m_WbFailed = false;
+        bool m_WbArmed = false;
+        uint32_t m_WbConnId = 0;
+        uint32_t m_WbCrtcId = 0;
+        uint32_t m_WbFbId = 0;
+        uint32_t m_WbHandle = 0;
+        uint32_t m_WbPitch = 0;
+        uint32_t m_WbW = 0;
+        uint32_t m_WbH = 0;
+        uint64_t m_WbSize = 0;
+        uint8_t* m_WbMap = nullptr;
+        int32_t m_WbFence = -1;
+        uint32_t m_WbCrtcIdProp = 0, m_WbFbProp = 0, m_WbFenceProp = 0;
+        unsigned m_WbCounter = 0;
+        unsigned m_WbInterval = 15;
+
         DrmPropertySetter(const DrmPropertySetter &) = delete;
         DrmPropertySetter(DrmPropertySetter &&) = delete;
 
         void initialize(int drmFd, bool wantsAtomic, bool wantsAsyncFlip) {
             m_Fd = drmFd;
             m_Atomic = wantsAtomic && drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+
+            // Writeback connectors are HIDDEN unless a client asks for them,
+            // and the cap has to be set before anything enumerates.
+            const char* wb = SDL_getenv("MOONLIGHT_FRAMEWB");
+            m_WbWanted = m_Atomic && wb && *wb && *wb != '0';
+            if (m_WbWanted &&
+                drmSetClientCap(m_Fd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1) != 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Writeback capture requested but the kernel refused the cap");
+                m_WbWanted = false;
+            }
 
             if (wantsAsyncFlip) {
                 uint64_t val;
@@ -586,6 +620,195 @@ class DrmRenderer : public IFFmpegRenderer {
             return ret;
         }
 
+        // ---------------------------------------------------------------
+        // stability/stream Phase 5(b): capture what was actually SCANNED OUT.
+        //
+        // The decoded-frame check one layer up proves the client decoded a new
+        // picture. It cannot prove the display controller composed and scanned
+        // that picture out — a stuck plane, a pacer that never flips, or a
+        // compositor drawing over the video all look identical from there.
+        // DRM writeback is the only instrument that answers it, because it
+        // reads back the composed CRTC output itself.
+        //
+        // Hard-won requirement: the writeback buffer must be NV12. VOP2's
+        // writeback path does no colour conversion ("YUV2RGB is not supported
+        // by writeback" — drivers/gpu/drm/rockchip), and this display pipeline
+        // runs YUV, so an RGB buffer is rejected with a bare EINVAL that looks
+        // exactly like "writeback is broken". It is not.
+        //
+        // Off unless MOONLIGHT_FRAMEWB is set: this adds a buffer and a fence
+        // wait to a per-frame commit, and a client someone is watching should
+        // pay nothing for a test harness.
+        //
+        // INERT ON THIS BOX, and the reason is worth writing down. Writeback
+        // needs an ATOMIC commit from the DRM master. Here the master belongs
+        // to Qt EGLFS, which drives the display through the LEGACY KMS API
+        // ("Captured Qt EGLFS DRM master fd (legacy)"), and DrmRenderer does
+        // not even initialise ("DRM encoder not found!") — so there is no
+        // atomic presentation path to attach to. The capability itself is
+        // real: ~/display/tools/drm-writeback-probe captures the composed
+        // output and decodes it correctly, standalone. Making this run would
+        // mean moving Qt EGLFS to atomic, which is a Qt-level change. Kept as
+        // the reference implementation for a stack that gets there.
+        // ---------------------------------------------------------------
+        bool wbPrepare(uint32_t crtcId, uint32_t width, uint32_t height) {
+            if (!m_WbWanted || m_WbFailed) {
+                return false;
+            }
+            if (m_WbFbId != 0) {
+                return true;
+            }
+
+            drmModeRes* res = drmModeGetResources(m_Fd);
+            if (res == nullptr) {
+                m_WbFailed = true;
+                return false;
+            }
+            for (int i = 0; i < res->count_connectors && m_WbConnId == 0; i++) {
+                drmModeConnector* c = drmModeGetConnector(m_Fd, res->connectors[i]);
+                if (c == nullptr) {
+                    continue;
+                }
+                if (c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+                    m_WbConnId = c->connector_id;
+                }
+                drmModeFreeConnector(c);
+            }
+            drmModeFreeResources(res);
+            if (m_WbConnId == 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "No DRM writeback connector; scanout capture disabled");
+                m_WbFailed = true;
+                return false;
+            }
+
+            m_WbCrtcIdProp = wbProp("CRTC_ID");
+            m_WbFbProp = wbProp("WRITEBACK_FB_ID");
+            m_WbFenceProp = wbProp("WRITEBACK_OUT_FENCE_PTR");
+            if (!m_WbCrtcIdProp || !m_WbFbProp || !m_WbFenceProp) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Writeback connector is a stub (missing properties)");
+                m_WbFailed = true;
+                return false;
+            }
+
+            // NV12 dumb buffer: luma plane then interleaved chroma, one
+            // allocation, which is all the barcode reader needs (luma only).
+            struct drm_mode_create_dumb creq = {};
+            creq.width = width;
+            creq.height = height * 3 / 2;
+            creq.bpp = 8;
+            if (drmIoctl(m_Fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+                m_WbFailed = true;
+                return false;
+            }
+            uint32_t handles[4] = { creq.handle, creq.handle, 0, 0 };
+            uint32_t pitches[4] = { creq.pitch, creq.pitch, 0, 0 };
+            uint32_t offsets[4] = { 0, creq.pitch * height, 0, 0 };
+            if (drmModeAddFB2(m_Fd, width, height, DRM_FORMAT_NV12,
+                              handles, pitches, offsets, &m_WbFbId, 0) < 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Writeback AddFB2(NV12) failed: %d", errno);
+                m_WbFailed = true;
+                return false;
+            }
+            struct drm_mode_map_dumb mreq = {};
+            mreq.handle = creq.handle;
+            if (drmIoctl(m_Fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+                m_WbFailed = true;
+                return false;
+            }
+            m_WbMap = (uint8_t*)mmap(nullptr, creq.size, PROT_READ, MAP_SHARED,
+                                     m_Fd, mreq.offset);
+            if (m_WbMap == MAP_FAILED) {
+                m_WbMap = nullptr;
+                m_WbFailed = true;
+                return false;
+            }
+            m_WbHandle = creq.handle;
+            m_WbSize = creq.size;
+            m_WbPitch = creq.pitch;
+            m_WbW = width;
+            m_WbH = height;
+            m_WbCrtcId = crtcId;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Writeback capture armed: connector %u, NV12 %ux%u",
+                        m_WbConnId, width, height);
+            return true;
+        }
+
+        uint32_t wbProp(const char* name) {
+            uint32_t id = 0;
+            drmModeObjectProperties* props =
+                drmModeObjectGetProperties(m_Fd, m_WbConnId, DRM_MODE_OBJECT_CONNECTOR);
+            if (props == nullptr) {
+                return 0;
+            }
+            for (uint32_t i = 0; i < props->count_props && id == 0; i++) {
+                drmModePropertyPtr p = drmModeGetProperty(m_Fd, props->props[i]);
+                if (p == nullptr) {
+                    continue;
+                }
+                if (SDL_strcmp(p->name, name) == 0) {
+                    id = p->prop_id;
+                }
+                drmModeFreeProperty(p);
+            }
+            drmModeFreeObjectProperties(props);
+            return id;
+        }
+
+        // Add the writeback attachment to the request that is about to commit.
+        void wbArm() {
+            if (m_WbFbId == 0 || m_WbFailed) {
+                return;
+            }
+            m_WbFence = -1;
+            set(m_WbConnId, DRM_MODE_OBJECT_CONNECTOR, m_WbCrtcIdProp, m_WbCrtcId);
+            set(m_WbConnId, DRM_MODE_OBJECT_CONNECTOR, m_WbFbProp, m_WbFbId);
+            set(m_WbConnId, DRM_MODE_OBJECT_CONNECTOR, m_WbFenceProp,
+                (uint64_t)(uintptr_t)&m_WbFence);
+            m_WbArmed = true;
+        }
+
+        // Wait for the capture and read the frame index out of it.
+        void wbHarvest(bool commitOk) {
+            if (!m_WbArmed) {
+                return;
+            }
+            m_WbArmed = false;
+            if (!commitOk) {
+                // One rejection is enough: retrying every frame would turn a
+                // harness feature into a permanent per-frame cost.
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Writeback commit rejected; scanout capture disabled");
+                m_WbFailed = true;
+                if (m_WbFence >= 0) {
+                    close(m_WbFence);
+                    m_WbFence = -1;
+                }
+                return;
+            }
+            if (m_WbFence >= 0) {
+                struct pollfd pfd = { m_WbFence, POLLIN, 0 };
+                poll(&pfd, 1, 100);
+                close(m_WbFence);
+                m_WbFence = -1;
+            }
+            long idx = fbcDecode(m_WbMap, (int)m_WbPitch, (int)m_WbW, (int)m_WbH, 1);
+            if (idx >= 0) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEWB,%llu,%ld",
+                            (unsigned long long)LiGetMicroseconds(), idx);
+            }
+        }
+
+        bool wbDue() {
+            if (!m_WbWanted || m_WbFailed) {
+                return false;
+            }
+            return (++m_WbCounter % m_WbInterval) == 0;
+        }
+
         bool apply() {
             if (!m_Atomic) {
                 return true;
@@ -654,6 +877,8 @@ class DrmRenderer : public IFFmpegRenderer {
                     err = drmModeAtomicCommit(m_Fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
                 }
             }
+
+            wbHarvest(err == 0);
 
             if (err == 0) {
                 m_TotalCommits++;

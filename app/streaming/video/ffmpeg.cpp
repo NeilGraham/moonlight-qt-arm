@@ -8,6 +8,7 @@
 extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
+#include "framebarcode.h"
 
 // stability/stream Phase 5(a): reading the frame-index barcode out of a
 // decoded frame needs to touch the decoder's own buffer.
@@ -786,10 +787,6 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
 // free, and a client someone is actually watching should pay nothing for a
 // test harness.
 // ---------------------------------------------------------------------------
-#define MLFI_CELLS      24
-#define MLFI_SYNC       4
-#define MLFI_DATA_BITS  20
-#define MLFI_MIN_CONTRAST 40
 #define MLFI_FOURCC_NV12 0x3231564Eu
 
 static bool mlfi_enabled()
@@ -813,60 +810,6 @@ static int mlfi_interval()
         }
     }
     return cached;
-}
-
-// Returns the decoded frame index, or -1 if this frame carries no barcode
-// (which is the honest answer for real console content, and must never be
-// reported as index 0).
-static long mlfi_decode(const uint8_t* luma, int stride, int w, int h)
-{
-    int stripH = h / 16;
-    if (stripH < 8) {
-        stripH = 8;
-    }
-    if (w < MLFI_CELLS * 4 || h < 16 || stride < w) {
-        return -1;
-    }
-    const uint8_t* row = luma + (size_t)(stripH / 2) * (size_t)stride;
-
-    int cells[MLFI_CELLS];
-    for (int i = 0; i < MLFI_CELLS; i++) {
-        int x0 = (int)(((long long)w * i) / MLFI_CELLS);
-        int x1 = (int)(((long long)w * (i + 1)) / MLFI_CELLS);
-        int cx = (x0 + x1) / 2;
-        int sum = 0, n = 0;
-        for (int dx = -2; dx <= 2; dx++) {
-            int x = cx + dx;
-            if (x >= 0 && x < w) {
-                sum += row[x];
-                n++;
-            }
-        }
-        cells[i] = n ? sum / n : 0;
-    }
-
-    // The sync cells calibrate black and white for THIS frame, so the decode
-    // survives limited range, codec ringing and any gain in the chain.
-    int white = (cells[0] + cells[2]) / 2;
-    int black = (cells[1] + cells[3]) / 2;
-    if (white - black < MLFI_MIN_CONTRAST) {
-        return -1;
-    }
-    int thresh = (white + black) / 2;
-
-    uint32_t gray = 0;
-    for (int k = 0; k < MLFI_DATA_BITS; k++) {
-        if (cells[MLFI_SYNC + (MLFI_DATA_BITS - 1 - k)] > thresh) {
-            gray |= (1u << k);
-        }
-    }
-    uint32_t bin = gray;
-    bin ^= bin >> 1;
-    bin ^= bin >> 2;
-    bin ^= bin >> 4;
-    bin ^= bin >> 8;
-    bin ^= bin >> 16;
-    return (long)(bin & ((1u << MLFI_DATA_BITS) - 1));
 }
 
 static void mlfi_sample(AVFrame* frame)
@@ -908,8 +851,8 @@ static void mlfi_sample(AVFrame* frame)
         struct dma_buf_sync sync;
         sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
         ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
-        idx = mlfi_decode((const uint8_t*)map + pl->offset, (int)pl->pitch,
-                          frame->width, frame->height);
+        idx = fbcDecode((const uint8_t*)map + pl->offset, (int)pl->pitch,
+                        frame->width, frame->height, 1);
         sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
         ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
         munmap(map, len);
@@ -917,8 +860,8 @@ static void mlfi_sample(AVFrame* frame)
     else
 #endif
     if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P) {
-        idx = mlfi_decode(frame->data[0], frame->linesize[0],
-                          frame->width, frame->height);
+        idx = fbcDecode(frame->data[0], frame->linesize[0],
+                        frame->width, frame->height, 1);
     }
 
     if (idx >= 0) {
