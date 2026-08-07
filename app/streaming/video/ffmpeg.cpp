@@ -9,6 +9,7 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include "framebarcode.h"
+#include "colorcheck.h"
 #include <time.h>
 
 // stability/stream Phase 5(a): reading the frame-index barcode out of a
@@ -861,6 +862,59 @@ static void mlfi_perf_report()
                 p.max_total_ns / 1000.0);
 }
 
+// --- colour accuracy (stability/color) --------------------------------------
+// Rides the mapping mlfi_sample() already took. The buffer access is what the
+// read costs (measured: 2090 us of which fbcDecode is 1.5), so checking colour
+// on the same map is very nearly free, and doing it anywhere else would pay
+// that cost twice.
+static bool mlcc_enabled()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = SDL_getenv("MOONLIGHT_COLORCHECK");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static int mlcc_interval()
+{
+    static int cached = 0;
+    if (cached == 0) {
+        const char* v = SDL_getenv("MOONLIGHT_COLORCHECK_EVERY");
+        cached = (v && *v) ? SDL_atoi(v) : 30;
+        if (cached < 1) {
+            cached = 30;
+        }
+    }
+    return cached;
+}
+
+static bool mlcc_due()
+{
+    static int counter = 0;
+    return (++counter % mlcc_interval()) == 0;
+}
+
+static void mlcc_emit(long idx, const CcResult& r)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ML-COLOR,%llu,%ld,%s,%d,%d,%d,%d,%.3f,%.3f,%.3f,%d",
+                (unsigned long long)LiGetMicroseconds(), idx,
+                r.limited_range ? "limited" : "full",
+                r.y_black, r.y_white,
+                r.clipped_black ? 1 : 0, r.clipped_white ? 1 : 0,
+                r.de_mean, r.de_p95, r.de_max, r.worst_idx);
+    // Per-patch rows are what make a failure actionable: "dE 12 on patch 13"
+    // is a red primary, and that is a matrix problem, not a range problem.
+    for (int i = 0; i < r.patches; i++) {
+        const CcPatchResult& p = r.patch[i];
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "ML-COLORPATCH,%ld,%d,%d,%d,%d,%d,%d,%d,%.3f",
+                    idx, p.idx, p.y, p.u, p.v, p.r, p.g, p.b, p.de);
+    }
+}
+
 static void mlfi_sample(AVFrame* frame)
 {
     if (!mlfi_enabled() || frame == nullptr) {
@@ -887,9 +941,22 @@ static void mlfi_sample(AVFrame* frame)
         }
         const AVDRMPlaneDescriptor* pl = &desc->layers[0].planes[0];
         const AVDRMObjectDescriptor* obj = &desc->objects[pl->object_index];
+        // The chroma plane is only needed for the colour check, and only when
+        // it lives in the same object — which for rkmpp NV12 it does.
+        const AVDRMPlaneDescriptor* pluv =
+            (desc->layers[0].nb_planes >= 2 &&
+             desc->layers[0].planes[1].object_index == pl->object_index)
+                ? &desc->layers[0].planes[1] : nullptr;
         size_t len = obj->size;
         if (len == 0) {
             len = (size_t)pl->offset + (size_t)pl->pitch * (size_t)frame->height;
+            if (pluv != nullptr) {
+                size_t uvend = (size_t)pluv->offset +
+                               (size_t)pluv->pitch * (size_t)(frame->height / 2);
+                if (uvend > len) {
+                    len = uvend;
+                }
+            }
         }
         const uint64_t t0 = mlfi_now_ns();
         void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, obj->fd, 0);
@@ -906,6 +973,14 @@ static void mlfi_sample(AVFrame* frame)
         idx = fbcDecode((const uint8_t*)map + pl->offset, (int)pl->pitch,
                         frame->width, frame->height, 1);
         const uint64_t tDec = mlfi_now_ns();
+        if (idx >= 0 && pluv != nullptr && mlcc_enabled() && mlcc_due()) {
+            CcResult cc;
+            if (ccCheckNV12((const uint8_t*)map + pl->offset, (int)pl->pitch,
+                            (const uint8_t*)map + pluv->offset, (int)pluv->pitch,
+                            frame->width, frame->height, &cc)) {
+                mlcc_emit(idx, cc);
+            }
+        }
         sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
         ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
         const uint64_t tSyncOut = mlfi_now_ns();
@@ -932,6 +1007,15 @@ static void mlfi_sample(AVFrame* frame)
     if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P) {
         idx = fbcDecode(frame->data[0], frame->linesize[0],
                         frame->width, frame->height, 1);
+        if (idx >= 0 && frame->format == AV_PIX_FMT_NV12 &&
+            mlcc_enabled() && mlcc_due()) {
+            CcResult cc;
+            if (ccCheckNV12(frame->data[0], frame->linesize[0],
+                            frame->data[1], frame->linesize[1],
+                            frame->width, frame->height, &cc)) {
+                mlcc_emit(idx, cc);
+            }
+        }
     }
 
     if (idx >= 0) {
