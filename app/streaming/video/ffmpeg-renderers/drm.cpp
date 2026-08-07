@@ -590,6 +590,44 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+    // The lookup above only succeeds when something has already bound our
+    // encoder to a CRTC. On a Qt EGLFS host that has taken the display through
+    // the LEGACY KMS API, encoder->crtc_id reads 0 here, so DrmRenderer gives
+    // up and Moonlight silently falls back to the EGL renderer — even though
+    // DrmRenderer is the PREFERRED path for this codec's pixel format.
+    //
+    // Picking a CRTC out of possible_crtcs is what txctl and the writeback
+    // probe both do, and it is very likely correct. It is gated anyway:
+    // switching the rendering path of a client someone is watching TV on is
+    // not a side effect a test harness gets to have. With MOONLIGHT_FORCE_DRM
+    // set (the stream-stability harness sets it), DrmRenderer initialises and
+    // the atomic present path exists — which is the ONLY way writeback capture
+    // can be attached to a real frame. See stability/stream FINDING 10.
+    if (!m_Crtc.isValid()) {
+        const char* forceDrm = SDL_getenv("MOONLIGHT_FORCE_DRM");
+        if (forceDrm != nullptr && *forceDrm != '\0' && *forceDrm != '0') {
+            for (i = 0; i < resources->count_encoders && !m_Crtc.isValid(); i++) {
+                drmModeEncoder* encoder = drmModeGetEncoder(m_DrmFd, resources->encoders[i]);
+                if (encoder == nullptr) {
+                    continue;
+                }
+                if (encoder->encoder_id == m_Encoder.objectId()) {
+                    for (int k = 0; k < resources->count_crtcs; k++) {
+                        if (encoder->possible_crtcs & (1U << k)) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "MOONLIGHT_FORCE_DRM: encoder %u has no CRTC bound; "
+                                        "using possible_crtcs[%d] = %u",
+                                        encoder->encoder_id, k, resources->crtcs[k]);
+                            m_Crtc.load(m_DrmFd, resources->crtcs[k], DRM_MODE_OBJECT_CRTC);
+                            break;
+                        }
+                    }
+                }
+                drmModeFreeEncoder(encoder);
+            }
+        }
+    }
+
     if (!m_Crtc.isValid()) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "DRM encoder not found!");
