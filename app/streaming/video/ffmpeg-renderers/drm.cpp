@@ -581,14 +581,18 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
             if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
                 m_Connector.load(m_DrmFd, resources->connectors[i], DRM_MODE_OBJECT_CONNECTOR);
 
-                // connector->encoder_id is the CURRENTLY BOUND encoder, and it
-                // is 0 whenever nothing holds that binding right now. Measured
-                // here: the first DrmRenderer probe sees encoder 207 (crtc 71)
-                // and succeeds; every probe after it reads 0, loads an encoder
-                // with objectId 0, matches nothing in the CRTC lookup, and
-                // reports "DRM encoder not found!" — so Moonlight falls back to
-                // EGL for the actual session even though DrmRenderer is the
-                // PREFERRED path for this codec's pixel format.
+                // connector->encoder_id is the CURRENTLY BOUND encoder and is
+                // 0 whenever nothing holds that binding right now.
+                //
+                // CORRECTION, kept deliberately: this was written while chasing
+                // a "DRM encoder not found!" that turned out to be SELF-
+                // INFLICTED — enabling the writeback client cap made the
+                // writeback connector enumerate and display discovery latched
+                // onto it. Against the pre-change baseline DrmRenderer had
+                // always initialised fine. This fallback is correct for the
+                // case it describes and is gated, but it is NOT fixing a
+                // pre-existing defect. The real fix is skipping writeback
+                // connectors below.
                 //
                 // connector->encoders[] is the list of encoders that CAN drive
                 // this connector, which is what we actually want.
