@@ -9,6 +9,7 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include "framebarcode.h"
+#include <time.h>
 
 // stability/stream Phase 5(a): reading the frame-index barcode out of a
 // decoded frame needs to touch the decoder's own buffer.
@@ -812,6 +813,54 @@ static int mlfi_interval()
     return cached;
 }
 
+// --- Phase 5(a) cost instrumentation ----------------------------------------
+// Whether the barcode can be read on EVERY frame is a measurement, not an
+// opinion. fbcDecode itself touches 120 bytes -- 24 cells x 5 samples on ONE
+// row -- so the pixel parse is free. The buffer ACCESS around it is the part
+// that might not scale to 60 Hz: mmap of a buffer up to 12 MB, whole-buffer
+// cache maintenance in DMA_BUF_IOCTL_SYNC (the uAPI has no partial range), and
+// munmap with its TLB shootdown. Each phase is therefore timed separately, so
+// a decision about the sampling interval rests on which one dominates rather
+// than on a guess about which one ought to.
+struct MlfiPerf {
+    uint64_t n;
+    uint64_t map_ns;
+    uint64_t syncin_ns;
+    uint64_t dec_ns;
+    uint64_t syncout_ns;
+    uint64_t unmap_ns;
+    uint64_t total_ns;
+    uint64_t max_total_ns;
+    size_t   buf_bytes;
+};
+static MlfiPerf g_mlfiPerf;
+
+static inline uint64_t mlfi_now_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// Averages, not a row per sample: at EVERY=1 a per-sample row would cost more
+// than the thing it measures. Cumulative, so any single row is a valid summary
+// of the run so far and a truncated log still answers the question.
+static void mlfi_perf_report()
+{
+    MlfiPerf& p = g_mlfiPerf;
+    if (p.n == 0 || (p.n % 300) != 0) {
+        return;
+    }
+    const double n = (double)p.n;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "ML-FBCPERF,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f",
+                (unsigned long long)p.n, (unsigned long long)p.buf_bytes,
+                p.map_ns / 1000.0 / n, p.syncin_ns / 1000.0 / n,
+                p.dec_ns / 1000.0 / n, p.syncout_ns / 1000.0 / n,
+                p.unmap_ns / 1000.0 / n, p.total_ns / 1000.0 / n,
+                p.max_total_ns / 1000.0);
+}
+
 static void mlfi_sample(AVFrame* frame)
 {
     if (!mlfi_enabled() || frame == nullptr) {
@@ -842,20 +891,41 @@ static void mlfi_sample(AVFrame* frame)
         if (len == 0) {
             len = (size_t)pl->offset + (size_t)pl->pitch * (size_t)frame->height;
         }
+        const uint64_t t0 = mlfi_now_ns();
         void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, obj->fd, 0);
         if (map == MAP_FAILED) {
             return;
         }
+        const uint64_t tMap = mlfi_now_ns();
         // The buffer was written by the decoder's DMA; without this the CPU
         // can read a stale cache line and decode a frame index from garbage.
         struct dma_buf_sync sync;
         sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
         ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        const uint64_t tSyncIn = mlfi_now_ns();
         idx = fbcDecode((const uint8_t*)map + pl->offset, (int)pl->pitch,
                         frame->width, frame->height, 1);
+        const uint64_t tDec = mlfi_now_ns();
         sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
         ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        const uint64_t tSyncOut = mlfi_now_ns();
         munmap(map, len);
+        const uint64_t tUnmap = mlfi_now_ns();
+
+        MlfiPerf& p = g_mlfiPerf;
+        p.n++;
+        p.buf_bytes  = len;
+        p.map_ns     += tMap - t0;
+        p.syncin_ns  += tSyncIn - tMap;
+        p.dec_ns     += tDec - tSyncIn;
+        p.syncout_ns += tSyncOut - tDec;
+        p.unmap_ns   += tUnmap - tSyncOut;
+        const uint64_t tot = tUnmap - t0;
+        p.total_ns += tot;
+        if (tot > p.max_total_ns) {
+            p.max_total_ns = tot;
+        }
+        mlfi_perf_report();
     }
     else
 #endif
