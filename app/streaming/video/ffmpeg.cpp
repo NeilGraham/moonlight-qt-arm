@@ -8,6 +8,15 @@
 extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
+
+// stability/stream Phase 5(a): reading the frame-index barcode out of a
+// decoded frame needs to touch the decoder's own buffer.
+#ifdef HAVE_DRM
+#include <libavutil/hwcontext_drm.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#endif
 }
 
 #include "ffmpeg-renderers/sdlvid.h"
@@ -753,6 +762,169 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     }
 
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// stability/stream Phase 5(a): decode the frame-index barcode out of a DECODED
+// frame and log it.
+//
+// The host can prove it captured, encoded and SENT a frame. It cannot prove
+// this box decoded a DIFFERENT one — a client that presents the same picture
+// for a second looks identical, from the host, to a client that is fine. This
+// reads the source's own frame counter back out of the decoded pixels, so
+// "the content advanced" becomes a measurement instead of an assumption.
+//
+// The barcode is a 24-cell strip across the top 1/16 of the frame: 4 sync
+// cells (white-black-white-black) then 20 Gray-coded data cells, MSB first.
+// Geometry is fractional, so the same arithmetic works at any resolution and
+// after any scaling. Gray coding bounds a torn read to +-1.
+// See stability/stream/engine/judges/barcode-decode.py — one format, three
+// implementations (txctl paints it, synthd paints it, this reads it).
+//
+// Off unless MOONLIGHT_FRAMEIDX is set: mapping a dma-buf is cheap but not
+// free, and a client someone is actually watching should pay nothing for a
+// test harness.
+// ---------------------------------------------------------------------------
+#define MLFI_CELLS      24
+#define MLFI_SYNC       4
+#define MLFI_DATA_BITS  20
+#define MLFI_MIN_CONTRAST 40
+#define MLFI_FOURCC_NV12 0x3231564Eu
+
+static bool mlfi_enabled()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = SDL_getenv("MOONLIGHT_FRAMEIDX");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static int mlfi_interval()
+{
+    static int cached = 0;
+    if (cached == 0) {
+        const char* v = SDL_getenv("MOONLIGHT_FRAMEIDX_EVERY");
+        cached = (v && *v) ? SDL_atoi(v) : 15;
+        if (cached < 1) {
+            cached = 15;
+        }
+    }
+    return cached;
+}
+
+// Returns the decoded frame index, or -1 if this frame carries no barcode
+// (which is the honest answer for real console content, and must never be
+// reported as index 0).
+static long mlfi_decode(const uint8_t* luma, int stride, int w, int h)
+{
+    int stripH = h / 16;
+    if (stripH < 8) {
+        stripH = 8;
+    }
+    if (w < MLFI_CELLS * 4 || h < 16 || stride < w) {
+        return -1;
+    }
+    const uint8_t* row = luma + (size_t)(stripH / 2) * (size_t)stride;
+
+    int cells[MLFI_CELLS];
+    for (int i = 0; i < MLFI_CELLS; i++) {
+        int x0 = (int)(((long long)w * i) / MLFI_CELLS);
+        int x1 = (int)(((long long)w * (i + 1)) / MLFI_CELLS);
+        int cx = (x0 + x1) / 2;
+        int sum = 0, n = 0;
+        for (int dx = -2; dx <= 2; dx++) {
+            int x = cx + dx;
+            if (x >= 0 && x < w) {
+                sum += row[x];
+                n++;
+            }
+        }
+        cells[i] = n ? sum / n : 0;
+    }
+
+    // The sync cells calibrate black and white for THIS frame, so the decode
+    // survives limited range, codec ringing and any gain in the chain.
+    int white = (cells[0] + cells[2]) / 2;
+    int black = (cells[1] + cells[3]) / 2;
+    if (white - black < MLFI_MIN_CONTRAST) {
+        return -1;
+    }
+    int thresh = (white + black) / 2;
+
+    uint32_t gray = 0;
+    for (int k = 0; k < MLFI_DATA_BITS; k++) {
+        if (cells[MLFI_SYNC + (MLFI_DATA_BITS - 1 - k)] > thresh) {
+            gray |= (1u << k);
+        }
+    }
+    uint32_t bin = gray;
+    bin ^= bin >> 1;
+    bin ^= bin >> 2;
+    bin ^= bin >> 4;
+    bin ^= bin >> 8;
+    bin ^= bin >> 16;
+    return (long)(bin & ((1u << MLFI_DATA_BITS) - 1));
+}
+
+static void mlfi_sample(AVFrame* frame)
+{
+    if (!mlfi_enabled() || frame == nullptr) {
+        return;
+    }
+    static int counter = 0;
+    if (++counter % mlfi_interval() != 0) {
+        return;
+    }
+
+    long idx = -1;
+
+#ifdef HAVE_DRM
+    if (frame->format == AV_PIX_FMT_DRM_PRIME) {
+        auto* desc = (AVDRMFrameDescriptor*)frame->data[0];
+        if (desc == nullptr || desc->nb_layers < 1 ||
+            desc->layers[0].nb_planes < 1) {
+            return;
+        }
+        // 10-bit packs 4 samples into 5 bytes; the byte-per-sample read below
+        // would be nonsense, so only NV12 is sampled.
+        if (desc->layers[0].format != MLFI_FOURCC_NV12) {
+            return;
+        }
+        const AVDRMPlaneDescriptor* pl = &desc->layers[0].planes[0];
+        const AVDRMObjectDescriptor* obj = &desc->objects[pl->object_index];
+        size_t len = obj->size;
+        if (len == 0) {
+            len = (size_t)pl->offset + (size_t)pl->pitch * (size_t)frame->height;
+        }
+        void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, obj->fd, 0);
+        if (map == MAP_FAILED) {
+            return;
+        }
+        // The buffer was written by the decoder's DMA; without this the CPU
+        // can read a stale cache line and decode a frame index from garbage.
+        struct dma_buf_sync sync;
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        idx = mlfi_decode((const uint8_t*)map + pl->offset, (int)pl->pitch,
+                          frame->width, frame->height);
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        munmap(map, len);
+    }
+    else
+#endif
+    if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P) {
+        idx = mlfi_decode(frame->data[0], frame->linesize[0],
+                          frame->width, frame->height);
+    }
+
+    if (idx >= 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEIDX,%llu,%ld",
+                    (unsigned long long)LiGetMicroseconds(), idx);
+    }
 }
 
 void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
@@ -1934,6 +2106,10 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     }
 
                     m_ActiveWndVideoStats.decodedFrames++;
+
+                    // Read the source's frame counter back out of the decoded
+                    // pixels (no-op unless MOONLIGHT_FRAMEIDX is set).
+                    mlfi_sample(frame);
 
                     // Queue the frame for rendering (or render now if pacer is disabled)
                     m_Pacer->submitFrame(frame);
