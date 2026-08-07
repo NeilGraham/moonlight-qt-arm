@@ -288,6 +288,7 @@ class DrmRenderer : public IFFmpegRenderer {
         uint32_t m_WbCrtcIdProp = 0, m_WbFbProp = 0, m_WbFenceProp = 0;
         unsigned m_WbCounter = 0;
         unsigned m_WbInterval = 15;
+        bool m_WbAnnounced = false;
 
         DrmPropertySetter(const DrmPropertySetter &) = delete;
         DrmPropertySetter(DrmPropertySetter &&) = delete;
@@ -658,9 +659,19 @@ class DrmRenderer : public IFFmpegRenderer {
             if (m_WbFbId != 0) {
                 return true;
             }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "wbPrepare: crtc=%u %ux%u", crtcId, width, height);
+
+            // Re-assert the cap on THIS fd. It is per-file-description, and the
+            // renderer that ends up live is not necessarily the instance whose
+            // initialize() set it.
+            int capRc = drmSetClientCap(m_Fd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "wbPrepare: writeback cap on fd %d -> %d", m_Fd, capRc);
 
             drmModeRes* res = drmModeGetResources(m_Fd);
             if (res == nullptr) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "wbPrepare: no resources");
                 m_WbFailed = true;
                 return false;
             }
@@ -669,6 +680,9 @@ class DrmRenderer : public IFFmpegRenderer {
                 if (c == nullptr) {
                     continue;
                 }
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "wbPrepare: connector %u type %u",
+                            c->connector_id, c->connector_type);
                 if (c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
                     m_WbConnId = c->connector_id;
                 }
@@ -699,6 +713,9 @@ class DrmRenderer : public IFFmpegRenderer {
             creq.height = height * 3 / 2;
             creq.bpp = 8;
             if (drmIoctl(m_Fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "wbPrepare: CREATE_DUMB %ux%u failed: %d",
+                            creq.width, creq.height, errno);
                 m_WbFailed = true;
                 return false;
             }
@@ -715,12 +732,16 @@ class DrmRenderer : public IFFmpegRenderer {
             struct drm_mode_map_dumb mreq = {};
             mreq.handle = creq.handle;
             if (drmIoctl(m_Fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "wbPrepare: MAP_DUMB failed: %d", errno);
                 m_WbFailed = true;
                 return false;
             }
             m_WbMap = (uint8_t*)mmap(nullptr, creq.size, PROT_READ, MAP_SHARED,
                                      m_Fd, mreq.offset);
             if (m_WbMap == MAP_FAILED) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "wbPrepare: mmap failed: %d", errno);
                 m_WbMap = nullptr;
                 m_WbFailed = true;
                 return false;
@@ -803,6 +824,12 @@ class DrmRenderer : public IFFmpegRenderer {
         }
 
         bool wbDue() {
+            if (!m_WbAnnounced && m_WbWanted) {
+                m_WbAnnounced = true;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "wbDue: wanted=%d failed=%d atomic=%d",
+                            (int)m_WbWanted, (int)m_WbFailed, (int)m_Atomic);
+            }
             if (!m_WbWanted || m_WbFailed) {
                 return false;
             }

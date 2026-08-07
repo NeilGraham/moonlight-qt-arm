@@ -550,6 +550,13 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
         return DIRECT_RENDERING_INIT_FAILED;
     }
 
+    // Gate for the display-discovery fallbacks below. Off by default: they
+    // change which renderer this client uses, and a client someone is watching
+    // TV on does not get that as a side effect of a test harness.
+    const char* forceDrmEnv = SDL_getenv("MOONLIGHT_FORCE_DRM");
+    const bool s_ForceDrm = forceDrmEnv != nullptr && *forceDrmEnv != '\0' &&
+                            *forceDrmEnv != '0';
+
     drmModeRes* resources = drmModeGetResources(m_DrmFd);
     if (resources == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -562,9 +569,38 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
     for (i = 0; i < resources->count_connectors && !m_Encoder.isValid(); i++) {
         drmModeConnector* connector = drmModeGetConnector(m_DrmFd, resources->connectors[i]);
         if (connector != nullptr) {
+            // A writeback connector is never a display. It is normally invisible,
+            // but asking for DRM_CLIENT_CAP_WRITEBACK_CONNECTORS (which the
+            // scanout-capture path must) makes it enumerate — and it then looks
+            // "connected" here, so display discovery latches onto IT instead of
+            // the HDMI output and every later probe fails.
+            if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+                drmModeFreeConnector(connector);
+                continue;
+            }
             if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
                 m_Connector.load(m_DrmFd, resources->connectors[i], DRM_MODE_OBJECT_CONNECTOR);
-                m_Encoder.load(m_DrmFd, connector->encoder_id, DRM_MODE_OBJECT_ENCODER);
+
+                // connector->encoder_id is the CURRENTLY BOUND encoder, and it
+                // is 0 whenever nothing holds that binding right now. Measured
+                // here: the first DrmRenderer probe sees encoder 207 (crtc 71)
+                // and succeeds; every probe after it reads 0, loads an encoder
+                // with objectId 0, matches nothing in the CRTC lookup, and
+                // reports "DRM encoder not found!" — so Moonlight falls back to
+                // EGL for the actual session even though DrmRenderer is the
+                // PREFERRED path for this codec's pixel format.
+                //
+                // connector->encoders[] is the list of encoders that CAN drive
+                // this connector, which is what we actually want.
+                uint32_t encoderId = connector->encoder_id;
+                if (encoderId == 0 && s_ForceDrm && connector->count_encoders > 0) {
+                    encoderId = connector->encoders[0];
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "MOONLIGHT_FORCE_DRM: connector %u has no encoder bound; "
+                                "using encoders[0] = %u",
+                                resources->connectors[i], encoderId);
+                }
+                m_Encoder.load(m_DrmFd, encoderId, DRM_MODE_OBJECT_ENCODER);
             }
 
             drmModeFreeConnector(connector);
@@ -603,9 +639,33 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
     // set (the stream-stability harness sets it), DrmRenderer initialises and
     // the atomic present path exists — which is the ONLY way writeback capture
     // can be attached to a real frame. See stability/stream FINDING 10.
+    if (s_ForceDrm) {
+        // Only under the harness gate: this is diagnostic detail, and a client
+        // someone is watching TV on should not pay for it in log volume.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "DRM discovery: MOONLIGHT_FORCE_DRM=%s connector=%s encoder=%s crtc=%s",
+                    forceDrmEnv ? forceDrmEnv : "(unset)",
+                    m_Connector.isValid() ? "valid" : "INVALID",
+                    m_Encoder.isValid() ? "valid" : "INVALID",
+                    m_Crtc.isValid() ? "valid" : "INVALID");
+        if (m_Encoder.isValid()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "DRM discovery: encoder objectId=%u", m_Encoder.objectId());
+            for (int k = 0; k < resources->count_encoders; k++) {
+                drmModeEncoder* e = drmModeGetEncoder(m_DrmFd, resources->encoders[k]);
+                if (e == nullptr) {
+                    continue;
+                }
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "DRM discovery:   encoder[%d] id=%u crtc_id=%u possible_crtcs=0x%x",
+                            k, e->encoder_id, e->crtc_id, e->possible_crtcs);
+                drmModeFreeEncoder(e);
+            }
+        }
+    }
+
     if (!m_Crtc.isValid()) {
-        const char* forceDrm = SDL_getenv("MOONLIGHT_FORCE_DRM");
-        if (forceDrm != nullptr && *forceDrm != '\0' && *forceDrm != '0') {
+        if (s_ForceDrm) {
             for (i = 0; i < resources->count_encoders && !m_Crtc.isValid(); i++) {
                 drmModeEncoder* encoder = drmModeGetEncoder(m_DrmFd, resources->encoders[i]);
                 if (encoder == nullptr) {
