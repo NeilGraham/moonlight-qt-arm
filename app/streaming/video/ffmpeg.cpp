@@ -12,7 +12,7 @@ extern "C" {
 #include "colorcheck.h"
 #include <time.h>
 
-// stability/stream Phase 5(a): reading the frame-index barcode out of a
+// tests/stream Phase 5(a): reading the frame-index barcode out of a
 // decoded frame needs to touch the decoder's own buffer.
 #ifdef HAVE_DRM
 #include <libavutil/hwcontext_drm.h>
@@ -769,7 +769,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
 
 
 // ---------------------------------------------------------------------------
-// stability/stream Phase 5(a): decode the frame-index barcode out of a DECODED
+// tests/stream Phase 5(a): decode the frame-index barcode out of a DECODED
 // frame and log it.
 //
 // The host can prove it captured, encoded and SENT a frame. It cannot prove
@@ -782,7 +782,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
 // cells (white-black-white-black) then 20 Gray-coded data cells, MSB first.
 // Geometry is fractional, so the same arithmetic works at any resolution and
 // after any scaling. Gray coding bounds a torn read to +-1.
-// See stability/stream/engine/judges/barcode-decode.py — one format, three
+// See tests/stream/engine/judges/barcode-decode.py — one format, three
 // implementations (txctl paints it, synthd paints it, this reads it).
 //
 // Off unless MOONLIGHT_FRAMEIDX is set: mapping a dma-buf is cheap but not
@@ -862,7 +862,7 @@ static void mlfi_perf_report()
                 p.max_total_ns / 1000.0);
 }
 
-// --- colour accuracy (stability/color) --------------------------------------
+// --- colour accuracy (tests/color) --------------------------------------
 // Rides the mapping mlfi_sample() already took. The buffer access is what the
 // read costs (measured: 2090 us of which fbcDecode is 1.5), so checking colour
 // on the same map is very nearly free, and doing it anywhere else would pay
@@ -2302,7 +2302,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
         }
 
-        // stability/stream: one machine-readable row per 1 s window.
+        // tests/stream: one machine-readable row per 1 s window.
         //
         // The on-screen overlay is for a human watching the TV, and the
         // end-of-session dump only reports the average of a run that has
@@ -2311,7 +2311,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         // the row lands on the same timeline as the host-side counters after
         // the clock-offset handshake.
         //
-        // Format (see stability/stream/engine/judges/stream-judge.py):
+        // Format (see tests/stream/engine/judges/stream-judge.py):
         //   ML-STATS-CSV,mono_us,recvFps,decFps,rendFps,netDropped,
         //     pacerDropped,hostLatMin,hostLatMax,hostLatAvg,rtt,rttVar,
         //     decodeMs,pacerMs,renderMs,mbps

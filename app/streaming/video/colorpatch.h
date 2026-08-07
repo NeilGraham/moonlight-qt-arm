@@ -3,7 +3,7 @@
 /*
  * colorpatch.h — the colour-accuracy patch set.
  *
- * SOURCE OF TRUTH. The painter (stability/hdmi-rx/engine/txctl.c) and the
+ * SOURCE OF TRUTH. The painter (tests/hdmi-rx/engine/txctl.c) and the
  * checker (moonlight-qt-arm app/streaming/video/colorpatch.h, a vendored copy)
  * both include this. The two copies must stay byte-identical: the whole test
  * rests on the painter and the checker agreeing on what colour a patch is, and

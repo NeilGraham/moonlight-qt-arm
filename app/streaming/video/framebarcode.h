@@ -11,8 +11,8 @@
 // Two call sites need this and they are in different translation units — the
 // decoded-frame check in ffmpeg.cpp and the scanned-out check in drm.cpp — so
 // it lives here rather than being written twice. The painters
-// (stability/hdmi-rx/engine/txctl.c, stability/stream/engine/synthsrc/synthd.c)
-// and the host-side reader (stability/stream/engine/judges/barcode-decode.py)
+// (tests/hdmi-rx/engine/txctl.c, tests/stream/engine/synthsrc/synthd.c)
+// and the host-side reader (tests/stream/engine/judges/barcode-decode.py)
 // must agree with these constants.
 
 #include <stdint.h>

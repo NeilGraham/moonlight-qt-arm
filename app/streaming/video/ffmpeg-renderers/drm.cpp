@@ -642,7 +642,7 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
     // not a side effect a test harness gets to have. With MOONLIGHT_FORCE_DRM
     // set (the stream-stability harness sets it), DrmRenderer initialises and
     // the atomic present path exists — which is the ONLY way writeback capture
-    // can be attached to a real frame. See stability/stream FINDING 10.
+    // can be attached to a real frame. See tests/stream FINDING 10.
     if (s_ForceDrm) {
         // Only under the harness gate: this is diagnostic detail, and a client
         // someone is watching TV on should not pay for it in log volume.

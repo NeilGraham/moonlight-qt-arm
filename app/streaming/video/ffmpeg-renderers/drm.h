@@ -622,7 +622,7 @@ class DrmRenderer : public IFFmpegRenderer {
         }
 
         // ---------------------------------------------------------------
-        // stability/stream Phase 5(b): capture what was actually SCANNED OUT.
+        // tests/stream Phase 5(b): capture what was actually SCANNED OUT.
         //
         // The decoded-frame check one layer up proves the client decoded a new
         // picture. It cannot prove the display controller composed and scanned
