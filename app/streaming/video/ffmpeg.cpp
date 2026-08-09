@@ -846,6 +846,46 @@ static inline uint64_t mlfi_now_ns()
 // Averages, not a row per sample: at EVERY=1 a per-sample row would cost more
 // than the thing it measures. Cumulative, so any single row is a valid summary
 // of the run so far and a truncated log still answers the question.
+// The vendor 6.1 kernel (Radxa/Rockchip) carries a PARTIAL cache-maintenance
+// ioctl that mainline does not: include/uapi/linux/dma-buf.h defines
+// DMA_BUF_IOCTL_SYNC_PARTIAL as _IOW('b', 2, struct dma_buf_sync_partial).
+// Declared locally with our own names because the fork builds against a
+// generic sysroot in the furnace container, and because a header that DID
+// define these should not collide with us.
+struct mlfi_dma_buf_sync_partial {
+    uint64_t flags;
+    uint32_t offset;
+    uint32_t len;
+};
+#define MLFI_DMA_BUF_IOCTL_SYNC_PARTIAL \
+    _IOW('b', 2, struct mlfi_dma_buf_sync_partial)
+
+static bool g_mlfiPartialSync = true;
+
+// Cache maintenance for just the bytes about to be read. The whole-buffer
+// ioctl invalidates the entire surface, which at 4K is 1.64 ms of the 2.24 ms
+// this instrument costs per frame. Falls back ONCE and then remembers, so an
+// exporter without the partial variant costs one failed ioctl per process
+// rather than one per frame.
+static void mlfi_sync(int fd, uint64_t rw, size_t off, size_t n)
+{
+    if (g_mlfiPartialSync) {
+        struct mlfi_dma_buf_sync_partial p;
+        p.flags  = rw;
+        p.offset = (uint32_t)off;
+        p.len    = (uint32_t)n;
+        if (ioctl(fd, MLFI_DMA_BUF_IOCTL_SYNC_PARTIAL, &p) == 0) {
+            return;
+        }
+        g_mlfiPartialSync = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "ML-FBCSYNC,partial unavailable, using whole-buffer sync");
+    }
+    struct dma_buf_sync s;
+    s.flags = rw;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
 static void mlfi_perf_report()
 {
     MlfiPerf& p = g_mlfiPerf;
@@ -915,9 +955,34 @@ static void mlcc_emit(long idx, const CcResult& r)
     }
 }
 
+// Cadence, with nothing standing between the question and the answer.
+//
+// The barcode read below maps and cache-syncs the decoded frame; even reduced
+// to the strip, the whole-buffer cache maintenance is ~1 ms at 1080p and the
+// worst case is several. That is on THIS thread, between avcodec_receive_frame()
+// and submitFrame(), so it perturbs the very delivery timing the harness uses
+// it to judge (~/tests FINDING 28). Identity and timing are different questions
+// and only one of them needs the pixels — so timing gets its own instrument:
+// one log line, no buffer access at all.
+static bool mlft_enabled()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("MOONLIGHT_FRAMETIME");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
 static void mlfi_sample(AVFrame* frame)
 {
-    if (!mlfi_enabled() || frame == nullptr) {
+    if (frame == nullptr) {
+        return;
+    }
+    if (mlft_enabled()) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMETIME,%llu",
+                    (unsigned long long)LiGetMicroseconds());
+    }
+    if (!mlfi_enabled()) {
         return;
     }
     static int counter = 0;
@@ -958,38 +1023,63 @@ static void mlfi_sample(AVFrame* frame)
                 }
             }
         }
+        // Only the barcode strip is ever read: fbcDecode() samples ONE row, at
+        // the middle of the top 1/16. Mapping and cache-syncing the WHOLE frame
+        // to get it cost 2.24 ms average and 15.99 ms worst at 4K60 — 96% of a
+        // frame period, on the decode thread between avcodec_receive_frame()
+        // and submitFrame(). That is more than enough to manufacture the judder
+        // this instrument exists to detect (~/tests FINDING 28), which made
+        // per-frame cadence at 4K60 unmeasurable.
+        //
+        // The colour check is the one caller that genuinely needs the whole
+        // surface, so it keeps the full mapping. Gating on mlcc_enabled()
+        // rather than mlcc_due() is deliberate: mlcc_due() has a side effect,
+        // and hoisting it above the decode would change the colour cadence.
+        const bool wantFull = (pluv != nullptr && mlcc_enabled());
+        const size_t pageSz = (size_t)sysconf(_SC_PAGESIZE);
+        size_t roiOff = (size_t)pl->offset;
+        size_t roiLen = len - roiOff;
+        size_t mapOff = 0;
+        size_t mapLen = len;
+        if (!wantFull) {
+            roiLen = (size_t)pl->pitch * (size_t)fbc_strip_h(frame->height);
+            if (roiOff + roiLen > len) {
+                roiLen = len - roiOff;
+            }
+            mapOff = roiOff & ~(pageSz - 1);
+            mapLen = (roiOff - mapOff) + roiLen;
+        }
         const uint64_t t0 = mlfi_now_ns();
-        void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, obj->fd, 0);
+        void* map = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, obj->fd,
+                         (off_t)mapOff);
         if (map == MAP_FAILED) {
             return;
         }
+        const uint8_t* luma = (const uint8_t*)map + (roiOff - mapOff);
         const uint64_t tMap = mlfi_now_ns();
         // The buffer was written by the decoder's DMA; without this the CPU
         // can read a stale cache line and decode a frame index from garbage.
-        struct dma_buf_sync sync;
-        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        mlfi_sync(obj->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ, roiOff, roiLen);
         const uint64_t tSyncIn = mlfi_now_ns();
-        idx = fbcDecode((const uint8_t*)map + pl->offset, (int)pl->pitch,
-                        frame->width, frame->height, 1);
+        idx = fbcDecode(luma, (int)pl->pitch, frame->width, frame->height, 1);
         const uint64_t tDec = mlfi_now_ns();
-        if (idx >= 0 && pluv != nullptr && mlcc_enabled() && mlcc_due()) {
+        if (idx >= 0 && wantFull && mlcc_due()) {
             CcResult cc;
-            if (ccCheckNV12((const uint8_t*)map + pl->offset, (int)pl->pitch,
-                            (const uint8_t*)map + pluv->offset, (int)pluv->pitch,
+            if (ccCheckNV12(luma, (int)pl->pitch,
+                            (const uint8_t*)map + (size_t)pluv->offset,
+                            (int)pluv->pitch,
                             frame->width, frame->height, &cc)) {
                 mlcc_emit(idx, cc);
             }
         }
-        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        mlfi_sync(obj->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ, roiOff, roiLen);
         const uint64_t tSyncOut = mlfi_now_ns();
-        munmap(map, len);
+        munmap(map, mapLen);
         const uint64_t tUnmap = mlfi_now_ns();
 
         MlfiPerf& p = g_mlfiPerf;
         p.n++;
-        p.buf_bytes  = len;
+        p.buf_bytes  = mapLen;
         p.map_ns     += tMap - t0;
         p.syncin_ns  += tSyncIn - tMap;
         p.dec_ns     += tDec - tSyncIn;
