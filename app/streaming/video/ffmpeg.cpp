@@ -556,8 +556,33 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_VideoDecoderCtx->pkt_timebase.num = 1;
     m_VideoDecoderCtx->pkt_timebase.den = 90000;
 
-    // Allocate enough extra frames for Pacer to avoid stalling the decoder
-    m_VideoDecoderCtx->extra_hw_frames = PACER_MAX_OUTSTANDING_FRAMES;
+    // Allocate enough extra frames for Pacer to avoid stalling the decoder.
+    //
+    // MOONLIGHT_EXTRA_HW_FRAMES adds to that pool WITHOUT deepening the pacer's
+    // presentation queue, so it buys decoder slack at no presentation latency.
+    // Measured on r5c (~/tests FINDING 33): complete frames ARRIVE with p99
+    // 17.12 ms against a 16.67 ms period — essentially perfect — while decode
+    // COMPLETION stalls ~36 ms about 11 times a minute and then emits two
+    // frames in the same microsecond. 36.1 ms is 18 iterations of the
+    // SDL_Delay(2) poll in the EAGAIN path, i.e. the decode thread spinning
+    // for an output buffer that the renderer still holds. That is this pool
+    // being too small for this hardware, and it is the only hop left after
+    // host encode, host send, cpufreq, thermal, DDR, scheduler contention and
+    // NIC IRQ placement were each excluded by measurement.
+    int extraHwFrames = PACER_MAX_OUTSTANDING_FRAMES;
+    {
+        const char* e = std::getenv("MOONLIGHT_EXTRA_HW_FRAMES");
+        if (e != nullptr && *e != '\0') {
+            const int add = std::atoi(e);
+            if (add > 0 && add <= 32) {
+                extraHwFrames += add;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "ML-HWFRAMES,%d (base %d + %d)",
+                            extraHwFrames, PACER_MAX_OUTSTANDING_FRAMES, add);
+            }
+        }
+    }
+    m_VideoDecoderCtx->extra_hw_frames = extraHwFrames;
 
     // For non-hwaccel decoders, set the pix_fmt to hint to the decoder which
     // format should be used. This is necessary for certain decoders like the
@@ -2357,6 +2382,22 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 {
     PLENTRY entry = du->bufferList;
     int err;
+
+    // When a COMPLETE frame reached this client, before any decoding.
+    //
+    // ML-FRAMETIME says when a frame finished decoding. That alone cannot tell
+    // a frame that ARRIVED late from one that arrived on time and decoded
+    // slowly, and every other suspect for the residual judder in ~/tests
+    // FINDING 30 has now been excluded by measurement — host encode, host send,
+    // cpufreq, thermal, DDR, scheduler contention and NIC IRQ placement. The
+    // two series together split arrival from decode, which is the last
+    // unmeasured hop. Same env var; no pixel access, one log line.
+    if (mlft_enabled()) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMERECV,%llu,%u,%u",
+                    (unsigned long long)LiGetMicroseconds(),
+                    (unsigned int)du->frameNumber,
+                    (unsigned int)du->fullLength);
+    }
 
     SDL_assert(m_CurrentTestMode != TestMode::TestFrameOnly);
 
