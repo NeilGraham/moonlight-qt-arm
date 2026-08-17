@@ -1,6 +1,8 @@
 #include "pacer.h"
 #include "streaming/streamutils.h"
 
+#include <cstdlib>
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -338,6 +340,24 @@ void Pacer::renderFrame(AVFrame* frame)
     // Render it
     m_VsyncRenderer->renderFrame(frame);
     uint64_t afterRender = LiGetMicroseconds();
+
+    // When this frame was handed to the display — the end of the client's
+    // stamp chain (ML-FRAMERECV arrival, ML-FRAMETIME decode-done, this).
+    // Same MOONLIGHT_FRAMETIME gate as the other two, replicated here because
+    // mlft_enabled() is a file-static of ffmpeg.cpp; frameNumber rides
+    // frame->opaque from the decoder (0 = unknown). Sits in Pacer so it is
+    // renderer-agnostic, and pairs the render bracket the stats overlay only
+    // reports as a 1 s mean. One log line, no pixel access.
+    static const bool presentTraceOn = [] {
+        const char* e = std::getenv("MOONLIGHT_FRAMETIME");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    if (presentTraceOn) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEPRESENT,%llu,%u,%llu",
+                    (unsigned long long)afterRender,
+                    (unsigned int)(uintptr_t)frame->opaque,
+                    (unsigned long long)(afterRender - beforeRender));
+    }
 
     m_VideoStats->totalRenderTimeUs += (afterRender - beforeRender);
     m_VideoStats->renderedFrames++;

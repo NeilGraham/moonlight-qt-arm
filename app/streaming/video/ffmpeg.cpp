@@ -1004,8 +1004,14 @@ static void mlfi_sample(AVFrame* frame)
         return;
     }
     if (mlft_enabled()) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMETIME,%llu",
-                    (unsigned long long)LiGetMicroseconds());
+        // 2nd column: the frame's protocol frameNumber (0 = unknown), stashed
+        // in frame->opaque at DU dequeue. Joins this decode-done instant to
+        // ML-FRAMERECV/ML-FRAMEPRESENT — and, through the host's
+        // SUNSHINE_VIDEO_TRACE rows, to the capture daemon's frame serial.
+        // Still zero pixel access.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMETIME,%llu,%u",
+                    (unsigned long long)LiGetMicroseconds(),
+                    (unsigned int)(uintptr_t)frame->opaque);
     }
     if (!mlfi_enabled()) {
         return;
@@ -2304,6 +2310,12 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // Capture a frame timestamp to measuring pacing delay
                     frame->pkt_dts = LiGetMicroseconds();
 
+                    // Carry the frame's identity to decode-done and present.
+                    // opaque is unused on this path (opaque_ref is NOT — the
+                    // DRM-PRIME mapping owns it) and av_frame_unref() clears
+                    // it, so 0 cleanly means "identity unknown".
+                    frame->opaque = nullptr;
+
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
@@ -2315,6 +2327,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
                         // Store the presentation time (90 kHz timebase)
                         frame->pts = (int64_t)du.rtpTimestamp;
+
+                        frame->opaque = (void*)(uintptr_t)du.frameNumber;
                     }
 
                     m_ActiveWndVideoStats.decodedFrames++;
@@ -2393,10 +2407,14 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     // two series together split arrival from decode, which is the last
     // unmeasured hop. Same env var; no pixel access, one log line.
     if (mlft_enabled()) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMERECV,%llu,%u,%u",
+        // 4th column: when this frame's FIRST packet arrived (same LiGetMicroseconds
+        // clock), so col1-col4 is the reassembly span per frame — the wire time the
+        // aggregate totalReassemblyTimeUs can only report as a 1 s mean.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMERECV,%llu,%u,%u,%llu",
                     (unsigned long long)LiGetMicroseconds(),
                     (unsigned int)du->frameNumber,
-                    (unsigned int)du->fullLength);
+                    (unsigned int)du->fullLength,
+                    (unsigned long long)du->receiveTimeUs);
     }
 
     SDL_assert(m_CurrentTestMode != TestMode::TestFrameOnly);
