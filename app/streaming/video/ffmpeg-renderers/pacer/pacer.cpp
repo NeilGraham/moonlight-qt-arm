@@ -173,13 +173,13 @@ int Pacer::renderThread(void* context)
         me->m_FrameQueueLock.lock();
 
         // Wait for a frame to be ready to render. With a jitter reserve,
-        // (re)start only once the reserve is full: after the stream starts,
-        // and after a stall long enough to drain it.
+        // start only once the reserve is full — at stream start, never again:
+        // a late frame spends the reserve and the paid-back early one that
+        // follows refills it by itself, while re-priming on an empty queue
+        // would repeat a vblank on exactly the event the reserve is for
+        // (measured: 157 present hitches/min against 8 with no reserve).
         {
             const int reserve = jitterFrames();
-            if (me->m_RenderQueue.isEmpty()) {
-                me->m_JitterPrimed = false;
-            }
             while (!me->m_Stopping &&
                    (me->m_RenderQueue.isEmpty() ||
                     (!me->m_JitterPrimed && me->m_RenderQueue.count() <= reserve))) {
