@@ -275,10 +275,18 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
         SDL_SysWMinfo info;
         SDL_VERSION(&info.version);
         if (!SDL_GetWindowWMInfo(window, &info)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "SDL_GetWindowWMInfo() failed: %s",
-                         SDL_GetError());
-            return false;
+            // MOONLIGHT_WB_SINK runs SDL offscreen, where there is no window
+            // system to ask. Nothing here needs one: the only vsync sources
+            // are DXGI and Wayland, and the DRM renderer paces itself with
+            // blocking atomic commits.
+            const char* sink = SDL_getenv("MOONLIGHT_WB_SINK");
+            if (sink == nullptr || *sink == '\0' || *sink == '0') {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "SDL_GetWindowWMInfo() failed: %s",
+                             SDL_GetError());
+                return false;
+            }
+            info.subsystem = SDL_SYSWM_UNKNOWN;
         }
 
         switch (info.subsystem) {
