@@ -21,6 +21,24 @@
 // must not exceed the number buffer pool size to avoid running the decoder
 // out of available decoding surfaces.
 #define MAX_QUEUED_FRAMES 3
+
+// MOONLIGHT_PACER_JITTER_FRAMES (0-2, default 0): frames held in reserve on
+// the render queue. At 120 Hz a frame period is 8.3 ms, and a frame that
+// arrives a few ms late (Wi-Fi) misses its vblank: the display repeats the
+// previous picture, and the next vblank finds two queued, so one is dropped.
+// With a reserve of J frames, presentation runs J frames behind arrival, a
+// late frame finds the reserve on screen instead of a repeat, and the queue
+// refills when it lands. Costs J frame periods of latency. 0 is the stock
+// lowest-latency policy.
+static int jitterFrames()
+{
+    static const int j = [] {
+        const char* e = std::getenv("MOONLIGHT_PACER_JITTER_FRAMES");
+        int v = e && *e ? std::atoi(e) : 0;
+        return v < 0 ? 0 : v > MAX_QUEUED_FRAMES - 1 ? MAX_QUEUED_FRAMES - 1 : v;
+    }();
+    return j;
+}
 static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
               "PACER_MAX_OUTSTANDING_FRAMES and MAX_QUEUED_FRAMES must agree");
 
@@ -154,9 +172,20 @@ int Pacer::renderThread(void* context)
         // the not empty condition
         me->m_FrameQueueLock.lock();
 
-        // Wait for a frame to be ready to render
-        while (!me->m_Stopping && me->m_RenderQueue.isEmpty()) {
-            me->m_RenderQueueNotEmpty.wait(&me->m_FrameQueueLock);
+        // Wait for a frame to be ready to render. With a jitter reserve,
+        // (re)start only once the reserve is full: after the stream starts,
+        // and after a stall long enough to drain it.
+        {
+            const int reserve = jitterFrames();
+            if (me->m_RenderQueue.isEmpty()) {
+                me->m_JitterPrimed = false;
+            }
+            while (!me->m_Stopping &&
+                   (me->m_RenderQueue.isEmpty() ||
+                    (!me->m_JitterPrimed && me->m_RenderQueue.count() <= reserve))) {
+                me->m_RenderQueueNotEmpty.wait(&me->m_FrameQueueLock);
+            }
+            me->m_JitterPrimed = true;
         }
 
         if (me->m_Stopping) {
@@ -387,12 +416,14 @@ void Pacer::renderFrame(AVFrame* frame)
         frameDropTarget = 1;
     }
     else {
-        frameDropTarget = 0;
+        // The jitter reserve is a queue length we WANT, not a backlog.
+        const int reserve = jitterFrames();
+        frameDropTarget = reserve;
         for (int queueHistoryEntry : std::as_const(m_RenderQueueHistory)) {
-            if (queueHistoryEntry == 0) {
+            if (queueHistoryEntry <= reserve) {
                 // Be lenient as long as the queue length
                 // resolves before the end of frame history
-                frameDropTarget = 2;
+                frameDropTarget = reserve + 2;
                 break;
             }
         }

@@ -57,6 +57,8 @@ private:
     void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
 
     QQueue<AVFrame*> m_RenderQueue;
+
+    bool m_JitterPrimed = false;  // render queue reached the jitter reserve
     QQueue<AVFrame*> m_PacingQueue;
     QQueue<int> m_PacingQueueHistory;
     QQueue<int> m_RenderQueueHistory;
