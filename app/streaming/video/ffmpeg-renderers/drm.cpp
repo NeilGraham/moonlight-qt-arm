@@ -2185,7 +2185,18 @@ void DrmRenderer::renderFrame(AVFrame* frame)
         src.h = frame->height;
         dst = m_OutputRect;
 
-        StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+        // Whole-number scaling (StreamUtils::integerScaleSourceToDestinationSurface)
+        // unless MOONLIGHT_RS_INTEGER_SCALE=0: the plane scaler filters, but
+        // at a whole factor every source pixel still gets the same footprint.
+        static const bool integerScale = qgetenv("MOONLIGHT_RS_INTEGER_SCALE") != "0";
+        if (integerScale && StreamUtils::integerScaleSourceToDestinationSurface(&src, &dst)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Whole-number scaling: %dx%d drawn %dx at %dx%d+%d+%d",
+                        src.w, src.h, dst.w / src.w, dst.w, dst.h, dst.x, dst.y);
+        }
+        else if (!integerScale) {
+            StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+        }
 
         // Set the video plane size and location
         m_PropSetter.configurePlane(m_VideoPlane, m_Crtc.objectId(),

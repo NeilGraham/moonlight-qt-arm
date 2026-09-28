@@ -14,6 +14,12 @@ public:
     static
     void scaleSourceToDestinationSurface(SDL_Rect* src, SDL_Rect* dst);
 
+    // scaleSourceToDestinationSurface(), but at the largest whole multiple of
+    // the source that fits when that costs at most 15% of the fitted height.
+    // Returns true when it took the whole multiple.
+    static
+    bool integerScaleSourceToDestinationSurface(SDL_Rect* src, SDL_Rect* dst);
+
     static
     void screenSpaceToNormalizedDeviceCoords(SDL_FRect* rect, int viewportWidth, int viewportHeight);
 
