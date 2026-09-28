@@ -2301,6 +2301,21 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         }
                     }
 
+                    if (frame->width != m_LastDecodedWidth || frame->height != m_LastDecodedHeight) {
+                        if (m_LastDecodedWidth != 0) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "Stream resolution changed mid-stream: %dx%d -> %dx%d (requested %dx%d)",
+                                        m_LastDecodedWidth,
+                                        m_LastDecodedHeight,
+                                        frame->width,
+                                        frame->height,
+                                        m_OriginalVideoWidth,
+                                        m_OriginalVideoHeight);
+                        }
+                        m_LastDecodedWidth = frame->width;
+                        m_LastDecodedHeight = frame->height;
+                    }
+
                     // Reset failed decodes count if we reached this far
                     m_ConsecutiveFailedDecodes = 0;
 
