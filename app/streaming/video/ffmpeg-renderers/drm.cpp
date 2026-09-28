@@ -67,6 +67,7 @@ extern "C" {
 #include <string.h>
 
 #include <sys/mman.h>
+#include <stdio.h>
 
 #include "streaming/streamutils.h"
 #include "streaming/session.h"
@@ -160,6 +161,9 @@ DrmRenderer::DrmRenderer(AVHWDeviceType hwDeviceType, IFFmpegRenderer *backendRe
       m_Version(nullptr),
       m_HdrOutputMetadataBlobId(0),
       m_OutputRect{},
+      m_Sink(false),
+      m_SinkMode{},
+      m_SinkModeBlob(0),
       m_SwFrameMapper(this),
       m_CurrentSwFrameIdx(0)
 #ifdef HAVE_EGL
@@ -192,6 +196,10 @@ DrmRenderer::~DrmRenderer()
 
     if (m_HdrOutputMetadataBlobId != 0) {
         drmModeDestroyPropertyBlob(m_DrmFd, m_HdrOutputMetadataBlobId);
+    }
+
+    if (m_SinkModeBlob != 0) {
+        drmModeDestroyPropertyBlob(m_DrmFd, m_SinkModeBlob);
     }
 
     if (m_Version != nullptr) {
@@ -306,6 +314,19 @@ void DrmRenderer::prepareToRender()
                     "Guessing CRTC is window size: %dx%d",
                     m_OutputRect.w,
                     m_OutputRect.h);
+    }
+
+    // The sink CRTC is modeset by this process, on the first commit below:
+    // it has no size until then, so the output rect is the sink mode's.
+    if (m_Sink) {
+        m_OutputRect.w = m_SinkMode.hdisplay;
+        m_OutputRect.h = m_SinkMode.vdisplay;
+        m_PropSetter.sinkAddState(true);
+        // The harness keys the dclk fixup (tests/stream/engine/wbprobe) on
+        // this line: which CRTC, and at what timing.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-SINK,%u,%ux%u,%u,%u",
+                    m_Crtc.objectId(), m_SinkMode.hdisplay, m_SinkMode.vdisplay,
+                    m_SinkMode.vrefresh, m_SinkMode.clock);
     }
 
     // Set HDMI content type to hopefully enable ALLM
@@ -431,6 +452,13 @@ void DrmRenderer::cleanupRenderContext()
         m_PropSetter.restorePlane(plane.second);
     }
 
+    // Take the sink CRTC down with its planes: it was inactive and linked to
+    // nothing when we found it.
+    if (m_Sink) {
+        m_PropSetter.wbPoll(100);
+        m_PropSetter.sinkAddState(false);
+    }
+
     m_PropSetter.apply();
 
     m_DrmStateModified = false;
@@ -445,6 +473,27 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
     m_Vsync = params->enableVsync;
     m_SwFrameMapper.setVideoFormat(params->videoFormat);
 
+    // MOONLIGHT_WB_SINK: present to a CRTC whose only connector is DRM
+    // writeback, so a full-rate stream can be decoded, composed and scanned
+    // out (into memory) with the HDMI output left dark. It exists for test
+    // runs while the TV must stay off: on this box any HDMI modeset or
+    // retrain can wake the household's TV. SDL and Qt must be kept off the
+    // display too (SDL_VIDEODRIVER=offscreen, QT_QPA_PLATFORM=offscreen), so
+    // there is no window FD to share: open the card ourselves. The vendor
+    // kernel does not enforce master for KMS ioctls, and the TV shell keeps
+    // master for its whole life — releasing it would restore fbdev's mode
+    // onto HDMI — so this FD never asks for master.
+    const char* sinkEnv = SDL_getenv("MOONLIGHT_WB_SINK");
+    m_Sink = sinkEnv != nullptr && *sinkEnv != '\0' && *sinkEnv != '0';
+    if (m_Sink) {
+        const char* card = SDL_getenv("MOONLIGHT_WB_SINK_CARD");
+        m_DrmFd = open(card && *card ? card : "/dev/dri/card0", O_RDWR | O_CLOEXEC);
+        if (m_DrmFd >= 0) {
+            m_MustCloseDrmFd = true;
+            m_DrmIsMaster = true;
+        }
+    }
+    else {
     // Try to get the FD that we're sharing with SDL
     m_DrmFd = StreamUtils::getDrmFdForWindow(m_Window, &m_MustCloseDrmFd);
     if (m_DrmFd >= 0) {
@@ -468,6 +517,7 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
             // This is a new FD that we must close
             m_MustCloseDrmFd = true;
         }
+    }
     }
 
     // Create the device context first because it is needed whether we can
@@ -565,6 +615,13 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
         return DIRECT_RENDERING_INIT_FAILED;
     }
 
+    if (m_Sink) {
+        if (!initializeSink()) {
+            drmModeFreeResources(resources);
+            return DIRECT_RENDERING_INIT_FAILED;
+        }
+    }
+    else {
     // Look for a connected connector and get the associated encoder
     for (i = 0; i < resources->count_connectors && !m_Encoder.isValid(); i++) {
         drmModeConnector* connector = drmModeGetConnector(m_DrmFd, resources->connectors[i]);
@@ -698,6 +755,7 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
         drmModeFreeResources(resources);
         return DIRECT_RENDERING_INIT_FAILED;
     }
+    }
 
     int crtcIndex = -1;
     for (int i = 0; i < resources->count_crtcs; i++) {
@@ -815,6 +873,13 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
                 continue;
             }
 
+            // The sink borrows only FREE planes: one already scanning out on
+            // another CRTC belongs to whoever owns that display (the TV shell).
+            if (m_Sink && plane->crtc_id != 0 && plane->crtc_id != m_Crtc.objectId()) {
+                drmModeFreePlane(plane);
+                continue;
+            }
+
             {
                 // Allow the user to override the plane selection logic
                 uint32_t userPlane;
@@ -926,7 +991,9 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
 
     // Find overlay planes when using the atomic API
     int overlayIndex = 0;
-    for (uint32_t i = 0; i < planeRes->count_planes && overlayIndex < Overlay::OverlayMax && m_PropSetter.isAtomic(); i++) {
+    // No overlays on the sink: every candidate plane would have to be a free
+    // one too, and a test run has no one to show a stats overlay to.
+    for (uint32_t i = 0; i < planeRes->count_planes && overlayIndex < Overlay::OverlayMax && m_PropSetter.isAtomic() && !m_Sink; i++) {
         drmModePlane* plane = drmModeGetPlane(m_DrmFd, planeRes->planes[i]);
         if (plane != nullptr) {
             // If the plane can't be used on our CRTC, don't consider it further
@@ -1042,6 +1109,119 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
     // If we got this far, we can do direct rendering via the DRM FD.
     m_SupportsDirectRendering = true;
 
+    return true;
+}
+
+// MOONLIGHT_WB_SINK: pick a CRTC that no display connector is linked to and
+// that is not scanning out, attach it to the writeback connector only, and
+// give it the requested timing (read, never driven, from a display
+// connector's mode list). MOONLIGHT_WB_SINK_MODE is WxH@HZ (default
+// 3840x2160@120); MOONLIGHT_WB_SINK_CRTC pins a CRTC id.
+//
+// Known limit on the RK3588 vendor kernel: vop2 computes a VP's dclk only
+// for a real output interface, so a writeback-only VP asks the CRU for 0 Hz
+// and runs at the divider floor (gpll/32 = 37.125 MHz, 15 Hz at 4K120). The
+// harness corrects it from outside (`wbprobe dclk-hold`, root, keyed on the
+// ML-SINK log line); this process only ever does what an unprivileged KMS
+// client can.
+bool DrmRenderer::initializeSink()
+{
+    int w = 3840, h = 2160, hz = 120;
+    const char* modeEnv = SDL_getenv("MOONLIGHT_WB_SINK_MODE");
+    if (modeEnv && *modeEnv && sscanf(modeEnv, "%dx%d@%d", &w, &h, &hz) != 3) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "MOONLIGHT_WB_SINK_MODE must be WxH@HZ, got '%s'", modeEnv);
+        return false;
+    }
+
+    if (drmSetClientCap(m_DrmFd, DRM_CLIENT_CAP_ATOMIC, 1) != 0 ||
+        drmSetClientCap(m_DrmFd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "WB sink: kernel refused the atomic/writeback client caps");
+        return false;
+    }
+
+    drmModeRes* res = drmModeGetResources(m_DrmFd);
+    if (res == nullptr) {
+        return false;
+    }
+
+    uint32_t wbConn = 0, wbPossible = 0;
+    std::set<uint32_t> linkedCrtcs;
+    bool haveMode = false;
+    for (int i = 0; i < res->count_connectors; i++) {
+        // Current state only: never trigger a probe of the display side.
+        drmModeConnector* c = drmModeGetConnectorCurrent(m_DrmFd, res->connectors[i]);
+        if (c == nullptr) {
+            continue;
+        }
+        DrmPropertyMap props { m_DrmFd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR };
+        if (c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+            wbConn = c->connector_id;
+            for (int e = 0; e < c->count_encoders; e++) {
+                drmModeEncoder* enc = drmModeGetEncoder(m_DrmFd, c->encoders[e]);
+                if (enc != nullptr) {
+                    wbPossible |= enc->possible_crtcs;
+                    drmModeFreeEncoder(enc);
+                }
+            }
+        }
+        else {
+            if (auto crtcProp = props.property("CRTC_ID"); crtcProp && crtcProp->initialValue()) {
+                linkedCrtcs.insert((uint32_t)crtcProp->initialValue());
+            }
+            for (int m = 0; m < c->count_modes && !haveMode; m++) {
+                const drmModeModeInfo& mi = c->modes[m];
+                if (mi.hdisplay == w && mi.vdisplay == h && (int)mi.vrefresh == hz &&
+                    !(mi.flags & DRM_MODE_FLAG_INTERLACE)) {
+                    m_SinkMode = mi;
+                    haveMode = true;
+                }
+            }
+        }
+        drmModeFreeConnector(c);
+    }
+
+    uint32_t pinned = 0;
+    Utils::getEnvironmentVariableOverride("MOONLIGHT_WB_SINK_CRTC", &pinned);
+    uint32_t crtcId = 0;
+    for (int i = 0; i < res->count_crtcs && crtcId == 0; i++) {
+        uint32_t id = res->crtcs[i];
+        if (!(wbPossible & (1u << i)) || (pinned && id != pinned) || linkedCrtcs.count(id)) {
+            continue;
+        }
+        DrmPropertyMap crtcProps { m_DrmFd, id, DRM_MODE_OBJECT_CRTC };
+        auto active = crtcProps.property("ACTIVE");
+        if (active && active->initialValue()) {
+            continue;
+        }
+        crtcId = id;
+    }
+    drmModeFreeResources(res);
+
+    if (wbConn == 0 || crtcId == 0 || !haveMode) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "WB sink unavailable: writeback=%u crtc=%u mode %dx%d@%d %s",
+                     wbConn, crtcId, w, h, hz, haveMode ? "found" : "NOT in any mode list");
+        return false;
+    }
+
+    m_Crtc.load(m_DrmFd, crtcId, DRM_MODE_OBJECT_CRTC);
+    if (drmModeCreatePropertyBlob(m_DrmFd, &m_SinkMode, sizeof(m_SinkMode), &m_SinkModeBlob) != 0) {
+        return false;
+    }
+    DrmPropertyMap wbProps { m_DrmFd, wbConn, DRM_MODE_OBJECT_CONNECTOR };
+    auto modeProp = m_Crtc.property("MODE_ID");
+    auto activeProp = m_Crtc.property("ACTIVE");
+    auto wbCrtcProp = wbProps.property("CRTC_ID");
+    if (!modeProp || !activeProp || !wbCrtcProp) {
+        return false;
+    }
+    m_PropSetter.sinkConfigure(crtcId, modeProp->id(), activeProp->id(), m_SinkModeBlob,
+                               wbConn, wbCrtcProp->id());
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "WB sink: crtc %u, writeback connector %u, mode %s (%u kHz)",
+                crtcId, wbConn, m_SinkMode.name, m_SinkMode.clock);
     return true;
 }
 

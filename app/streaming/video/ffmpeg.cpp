@@ -556,8 +556,33 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_VideoDecoderCtx->pkt_timebase.num = 1;
     m_VideoDecoderCtx->pkt_timebase.den = 90000;
 
-    // Allocate enough extra frames for Pacer to avoid stalling the decoder
-    m_VideoDecoderCtx->extra_hw_frames = PACER_MAX_OUTSTANDING_FRAMES;
+    // Allocate enough extra frames for Pacer to avoid stalling the decoder.
+    //
+    // MOONLIGHT_EXTRA_HW_FRAMES adds to that pool WITHOUT deepening the pacer's
+    // presentation queue, so it buys decoder slack at no presentation latency.
+    // Measured on r5c (~/tests FINDING 33): complete frames ARRIVE with p99
+    // 17.12 ms against a 16.67 ms period — essentially perfect — while decode
+    // COMPLETION stalls ~36 ms about 11 times a minute and then emits two
+    // frames in the same microsecond. 36.1 ms is 18 iterations of the
+    // SDL_Delay(2) poll in the EAGAIN path, i.e. the decode thread spinning
+    // for an output buffer that the renderer still holds. That is this pool
+    // being too small for this hardware, and it is the only hop left after
+    // host encode, host send, cpufreq, thermal, DDR, scheduler contention and
+    // NIC IRQ placement were each excluded by measurement.
+    int extraHwFrames = PACER_MAX_OUTSTANDING_FRAMES;
+    {
+        const char* e = std::getenv("MOONLIGHT_EXTRA_HW_FRAMES");
+        if (e != nullptr && *e != '\0') {
+            const int add = std::atoi(e);
+            if (add > 0 && add <= 32) {
+                extraHwFrames += add;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "ML-HWFRAMES,%d (base %d + %d)",
+                            extraHwFrames, PACER_MAX_OUTSTANDING_FRAMES, add);
+            }
+        }
+    }
+    m_VideoDecoderCtx->extra_hw_frames = extraHwFrames;
 
     // For non-hwaccel decoders, set the pix_fmt to hint to the decoder which
     // format should be used. This is necessary for certain decoders like the
@@ -846,6 +871,46 @@ static inline uint64_t mlfi_now_ns()
 // Averages, not a row per sample: at EVERY=1 a per-sample row would cost more
 // than the thing it measures. Cumulative, so any single row is a valid summary
 // of the run so far and a truncated log still answers the question.
+// The vendor 6.1 kernel (Radxa/Rockchip) carries a PARTIAL cache-maintenance
+// ioctl that mainline does not: include/uapi/linux/dma-buf.h defines
+// DMA_BUF_IOCTL_SYNC_PARTIAL as _IOW('b', 2, struct dma_buf_sync_partial).
+// Declared locally with our own names because the fork builds against a
+// generic sysroot in the furnace container, and because a header that DID
+// define these should not collide with us.
+struct mlfi_dma_buf_sync_partial {
+    uint64_t flags;
+    uint32_t offset;
+    uint32_t len;
+};
+#define MLFI_DMA_BUF_IOCTL_SYNC_PARTIAL \
+    _IOW('b', 2, struct mlfi_dma_buf_sync_partial)
+
+static bool g_mlfiPartialSync = true;
+
+// Cache maintenance for just the bytes about to be read. The whole-buffer
+// ioctl invalidates the entire surface, which at 4K is 1.64 ms of the 2.24 ms
+// this instrument costs per frame. Falls back ONCE and then remembers, so an
+// exporter without the partial variant costs one failed ioctl per process
+// rather than one per frame.
+static void mlfi_sync(int fd, uint64_t rw, size_t off, size_t n)
+{
+    if (g_mlfiPartialSync) {
+        struct mlfi_dma_buf_sync_partial p;
+        p.flags  = rw;
+        p.offset = (uint32_t)off;
+        p.len    = (uint32_t)n;
+        if (ioctl(fd, MLFI_DMA_BUF_IOCTL_SYNC_PARTIAL, &p) == 0) {
+            return;
+        }
+        g_mlfiPartialSync = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "ML-FBCSYNC,partial unavailable, using whole-buffer sync");
+    }
+    struct dma_buf_sync s;
+    s.flags = rw;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
 static void mlfi_perf_report()
 {
     MlfiPerf& p = g_mlfiPerf;
@@ -915,9 +980,40 @@ static void mlcc_emit(long idx, const CcResult& r)
     }
 }
 
+// Cadence, with nothing standing between the question and the answer.
+//
+// The barcode read below maps and cache-syncs the decoded frame; even reduced
+// to the strip, the whole-buffer cache maintenance is ~1 ms at 1080p and the
+// worst case is several. That is on THIS thread, between avcodec_receive_frame()
+// and submitFrame(), so it perturbs the very delivery timing the harness uses
+// it to judge (~/tests FINDING 28). Identity and timing are different questions
+// and only one of them needs the pixels — so timing gets its own instrument:
+// one log line, no buffer access at all.
+static bool mlft_enabled()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("MOONLIGHT_FRAMETIME");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
 static void mlfi_sample(AVFrame* frame)
 {
-    if (!mlfi_enabled() || frame == nullptr) {
+    if (frame == nullptr) {
+        return;
+    }
+    if (mlft_enabled()) {
+        // 2nd column: the frame's protocol frameNumber (0 = unknown), stashed
+        // in frame->opaque at DU dequeue. Joins this decode-done instant to
+        // ML-FRAMERECV/ML-FRAMEPRESENT — and, through the host's
+        // SUNSHINE_VIDEO_TRACE rows, to the capture daemon's frame serial.
+        // Still zero pixel access.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMETIME,%llu,%u",
+                    (unsigned long long)LiGetMicroseconds(),
+                    (unsigned int)(uintptr_t)frame->opaque);
+    }
+    if (!mlfi_enabled()) {
         return;
     }
     static int counter = 0;
@@ -958,38 +1054,63 @@ static void mlfi_sample(AVFrame* frame)
                 }
             }
         }
+        // Only the barcode strip is ever read: fbcDecode() samples ONE row, at
+        // the middle of the top 1/16. Mapping and cache-syncing the WHOLE frame
+        // to get it cost 2.24 ms average and 15.99 ms worst at 4K60 — 96% of a
+        // frame period, on the decode thread between avcodec_receive_frame()
+        // and submitFrame(). That is more than enough to manufacture the judder
+        // this instrument exists to detect (~/tests FINDING 28), which made
+        // per-frame cadence at 4K60 unmeasurable.
+        //
+        // The colour check is the one caller that genuinely needs the whole
+        // surface, so it keeps the full mapping. Gating on mlcc_enabled()
+        // rather than mlcc_due() is deliberate: mlcc_due() has a side effect,
+        // and hoisting it above the decode would change the colour cadence.
+        const bool wantFull = (pluv != nullptr && mlcc_enabled());
+        const size_t pageSz = (size_t)sysconf(_SC_PAGESIZE);
+        size_t roiOff = (size_t)pl->offset;
+        size_t roiLen = len - roiOff;
+        size_t mapOff = 0;
+        size_t mapLen = len;
+        if (!wantFull) {
+            roiLen = (size_t)pl->pitch * (size_t)fbc_strip_h(frame->height);
+            if (roiOff + roiLen > len) {
+                roiLen = len - roiOff;
+            }
+            mapOff = roiOff & ~(pageSz - 1);
+            mapLen = (roiOff - mapOff) + roiLen;
+        }
         const uint64_t t0 = mlfi_now_ns();
-        void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, obj->fd, 0);
+        void* map = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, obj->fd,
+                         (off_t)mapOff);
         if (map == MAP_FAILED) {
             return;
         }
+        const uint8_t* luma = (const uint8_t*)map + (roiOff - mapOff);
         const uint64_t tMap = mlfi_now_ns();
         // The buffer was written by the decoder's DMA; without this the CPU
         // can read a stale cache line and decode a frame index from garbage.
-        struct dma_buf_sync sync;
-        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        mlfi_sync(obj->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ, roiOff, roiLen);
         const uint64_t tSyncIn = mlfi_now_ns();
-        idx = fbcDecode((const uint8_t*)map + pl->offset, (int)pl->pitch,
-                        frame->width, frame->height, 1);
+        idx = fbcDecode(luma, (int)pl->pitch, frame->width, frame->height, 1);
         const uint64_t tDec = mlfi_now_ns();
-        if (idx >= 0 && pluv != nullptr && mlcc_enabled() && mlcc_due()) {
+        if (idx >= 0 && wantFull && mlcc_due()) {
             CcResult cc;
-            if (ccCheckNV12((const uint8_t*)map + pl->offset, (int)pl->pitch,
-                            (const uint8_t*)map + pluv->offset, (int)pluv->pitch,
+            if (ccCheckNV12(luma, (int)pl->pitch,
+                            (const uint8_t*)map + (size_t)pluv->offset,
+                            (int)pluv->pitch,
                             frame->width, frame->height, &cc)) {
                 mlcc_emit(idx, cc);
             }
         }
-        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-        ioctl(obj->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        mlfi_sync(obj->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ, roiOff, roiLen);
         const uint64_t tSyncOut = mlfi_now_ns();
-        munmap(map, len);
+        munmap(map, mapLen);
         const uint64_t tUnmap = mlfi_now_ns();
 
         MlfiPerf& p = g_mlfiPerf;
         p.n++;
-        p.buf_bytes  = len;
+        p.buf_bytes  = mapLen;
         p.map_ns     += tMap - t0;
         p.syncin_ns  += tSyncIn - tMap;
         p.dec_ns     += tDec - tSyncIn;
@@ -2180,6 +2301,21 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         }
                     }
 
+                    if (frame->width != m_LastDecodedWidth || frame->height != m_LastDecodedHeight) {
+                        if (m_LastDecodedWidth != 0) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "Stream resolution changed mid-stream: %dx%d -> %dx%d (requested %dx%d)",
+                                        m_LastDecodedWidth,
+                                        m_LastDecodedHeight,
+                                        frame->width,
+                                        frame->height,
+                                        m_OriginalVideoWidth,
+                                        m_OriginalVideoHeight);
+                        }
+                        m_LastDecodedWidth = frame->width;
+                        m_LastDecodedHeight = frame->height;
+                    }
+
                     // Reset failed decodes count if we reached this far
                     m_ConsecutiveFailedDecodes = 0;
 
@@ -2188,6 +2324,12 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
                     // Capture a frame timestamp to measuring pacing delay
                     frame->pkt_dts = LiGetMicroseconds();
+
+                    // Carry the frame's identity to decode-done and present.
+                    // opaque is unused on this path (opaque_ref is NOT — the
+                    // DRM-PRIME mapping owns it) and av_frame_unref() clears
+                    // it, so 0 cleanly means "identity unknown".
+                    frame->opaque = nullptr;
 
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
@@ -2200,6 +2342,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
                         // Store the presentation time (90 kHz timebase)
                         frame->pts = (int64_t)du.rtpTimestamp;
+
+                        frame->opaque = (void*)(uintptr_t)du.frameNumber;
                     }
 
                     m_ActiveWndVideoStats.decodedFrames++;
@@ -2267,6 +2411,26 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 {
     PLENTRY entry = du->bufferList;
     int err;
+
+    // When a COMPLETE frame reached this client, before any decoding.
+    //
+    // ML-FRAMETIME says when a frame finished decoding. That alone cannot tell
+    // a frame that ARRIVED late from one that arrived on time and decoded
+    // slowly, and every other suspect for the residual judder in ~/tests
+    // FINDING 30 has now been excluded by measurement — host encode, host send,
+    // cpufreq, thermal, DDR, scheduler contention and NIC IRQ placement. The
+    // two series together split arrival from decode, which is the last
+    // unmeasured hop. Same env var; no pixel access, one log line.
+    if (mlft_enabled()) {
+        // 4th column: when this frame's FIRST packet arrived (same LiGetMicroseconds
+        // clock), so col1-col4 is the reassembly span per frame — the wire time the
+        // aggregate totalReassemblyTimeUs can only report as a 1 s mean.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMERECV,%llu,%u,%u,%llu",
+                    (unsigned long long)LiGetMicroseconds(),
+                    (unsigned int)du->frameNumber,
+                    (unsigned int)du->fullLength,
+                    (unsigned long long)du->receiveTimeUs);
+    }
 
     SDL_assert(m_CurrentTestMode != TestMode::TestFrameOnly);
 

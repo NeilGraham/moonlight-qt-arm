@@ -1,6 +1,8 @@
 #include "pacer.h"
 #include "streaming/streamutils.h"
 
+#include <cstdlib>
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -19,6 +21,24 @@
 // must not exceed the number buffer pool size to avoid running the decoder
 // out of available decoding surfaces.
 #define MAX_QUEUED_FRAMES 3
+
+// MOONLIGHT_PACER_JITTER_FRAMES (0-2, default 0): frames held in reserve on
+// the render queue. At 120 Hz a frame period is 8.3 ms, and a frame that
+// arrives a few ms late (Wi-Fi) misses its vblank: the display repeats the
+// previous picture, and the next vblank finds two queued, so one is dropped.
+// With a reserve of J frames, presentation runs J frames behind arrival, a
+// late frame finds the reserve on screen instead of a repeat, and the queue
+// refills when it lands. Costs J frame periods of latency. 0 is the stock
+// lowest-latency policy.
+static int jitterFrames()
+{
+    static const int j = [] {
+        const char* e = std::getenv("MOONLIGHT_PACER_JITTER_FRAMES");
+        int v = e && *e ? std::atoi(e) : 0;
+        return v < 0 ? 0 : v > MAX_QUEUED_FRAMES - 1 ? MAX_QUEUED_FRAMES - 1 : v;
+    }();
+    return j;
+}
 static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
               "PACER_MAX_OUTSTANDING_FRAMES and MAX_QUEUED_FRAMES must agree");
 
@@ -152,9 +172,20 @@ int Pacer::renderThread(void* context)
         // the not empty condition
         me->m_FrameQueueLock.lock();
 
-        // Wait for a frame to be ready to render
-        while (!me->m_Stopping && me->m_RenderQueue.isEmpty()) {
-            me->m_RenderQueueNotEmpty.wait(&me->m_FrameQueueLock);
+        // Wait for a frame to be ready to render. With a jitter reserve,
+        // start only once the reserve is full — at stream start, never again:
+        // a late frame spends the reserve and the paid-back early one that
+        // follows refills it by itself, while re-priming on an empty queue
+        // would repeat a vblank on exactly the event the reserve is for
+        // (measured: 157 present hitches/min against 8 with no reserve).
+        {
+            const int reserve = jitterFrames();
+            while (!me->m_Stopping &&
+                   (me->m_RenderQueue.isEmpty() ||
+                    (!me->m_JitterPrimed && me->m_RenderQueue.count() <= reserve))) {
+                me->m_RenderQueueNotEmpty.wait(&me->m_FrameQueueLock);
+            }
+            me->m_JitterPrimed = true;
         }
 
         if (me->m_Stopping) {
@@ -273,10 +304,18 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
         SDL_SysWMinfo info;
         SDL_VERSION(&info.version);
         if (!SDL_GetWindowWMInfo(window, &info)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "SDL_GetWindowWMInfo() failed: %s",
-                         SDL_GetError());
-            return false;
+            // MOONLIGHT_WB_SINK runs SDL offscreen, where there is no window
+            // system to ask. Nothing here needs one: the only vsync sources
+            // are DXGI and Wayland, and the DRM renderer paces itself with
+            // blocking atomic commits.
+            const char* sink = SDL_getenv("MOONLIGHT_WB_SINK");
+            if (sink == nullptr || *sink == '\0' || *sink == '0') {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "SDL_GetWindowWMInfo() failed: %s",
+                             SDL_GetError());
+                return false;
+            }
+            info.subsystem = SDL_SYSWM_UNKNOWN;
         }
 
         switch (info.subsystem) {
@@ -339,6 +378,24 @@ void Pacer::renderFrame(AVFrame* frame)
     m_VsyncRenderer->renderFrame(frame);
     uint64_t afterRender = LiGetMicroseconds();
 
+    // When this frame was handed to the display — the end of the client's
+    // stamp chain (ML-FRAMERECV arrival, ML-FRAMETIME decode-done, this).
+    // Same MOONLIGHT_FRAMETIME gate as the other two, replicated here because
+    // mlft_enabled() is a file-static of ffmpeg.cpp; frameNumber rides
+    // frame->opaque from the decoder (0 = unknown). Sits in Pacer so it is
+    // renderer-agnostic, and pairs the render bracket the stats overlay only
+    // reports as a 1 s mean. One log line, no pixel access.
+    static const bool presentTraceOn = [] {
+        const char* e = std::getenv("MOONLIGHT_FRAMETIME");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    if (presentTraceOn) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEPRESENT,%llu,%u,%llu",
+                    (unsigned long long)afterRender,
+                    (unsigned int)(uintptr_t)frame->opaque,
+                    (unsigned long long)(afterRender - beforeRender));
+    }
+
     m_VideoStats->totalRenderTimeUs += (afterRender - beforeRender);
     m_VideoStats->renderedFrames++;
 
@@ -359,12 +416,14 @@ void Pacer::renderFrame(AVFrame* frame)
         frameDropTarget = 1;
     }
     else {
-        frameDropTarget = 0;
+        // The jitter reserve is a queue length we WANT, not a backlog.
+        const int reserve = jitterFrames();
+        frameDropTarget = reserve;
         for (int queueHistoryEntry : std::as_const(m_RenderQueueHistory)) {
-            if (queueHistoryEntry == 0) {
+            if (queueHistoryEntry <= reserve) {
                 // Be lenient as long as the queue length
                 // resolves before the end of frame history
-                frameDropTarget = 2;
+                frameDropTarget = reserve + 2;
                 break;
             }
         }

@@ -158,6 +158,17 @@ void StreamUtils::screenSpaceToNormalizedDeviceCoords(SDL_Rect* src, SDL_FRect* 
 
 int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
 {
+    // MOONLIGHT_WB_SINK: the display is a writeback-only CRTC that
+    // DrmRenderer modesets itself; SDL runs offscreen and knows nothing of
+    // it. Pace against the sink timing, or a 120 Hz sink is paced as 60.
+    if (const char* sink = SDL_getenv("MOONLIGHT_WB_SINK"); sink && *sink && *sink != '0') {
+        int w = 3840, h = 2160, hz = 120;
+        const char* mode = SDL_getenv("MOONLIGHT_WB_SINK_MODE");
+        if (!mode || !*mode || sscanf(mode, "%dx%d@%d", &w, &h, &hz) == 3) {
+            return hz;
+        }
+    }
+
     int displayIndex = SDL_GetWindowDisplayIndex(window);
     if (displayIndex < 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

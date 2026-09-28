@@ -289,6 +289,42 @@ class DrmRenderer : public IFFmpegRenderer {
         unsigned m_WbCounter = 0;
         unsigned m_WbInterval = 15;
         bool m_WbAnnounced = false;
+        // A capture whose commit has landed but whose frame may still be
+        // scanning out. Read on a LATER apply() instead of waiting here: a
+        // blocking commit returns at the vblank that latches frame N, and N's
+        // writeback completes one scanout later, so waiting for it inline
+        // made the next commit miss its vblank and the instrument inserted
+        // a repeated frame every m_WbInterval frames. At 120 Hz that is a
+        // visible judder the measurement itself caused.
+        bool m_WbPending = false;
+
+        // --- writeback-only sink (MOONLIGHT_WB_SINK, DrmRenderer::initializeSink) ---
+        // The sink CRTC has no connector except writeback, so every commit
+        // that can modeset carries its MODE_ID, ACTIVE and the writeback
+        // link: the real commits, and the TEST_ONLY probe in testPlane(),
+        // which would otherwise aim a plane at an inactive CRTC and fail.
+        uint32_t m_SinkCrtcId = 0, m_SinkModeBlob = 0, m_SinkWbConnId = 0;
+        uint32_t m_SinkModeProp = 0, m_SinkActiveProp = 0, m_SinkWbCrtcProp = 0;
+
+        void sinkConfigure(uint32_t crtcId, uint32_t modeProp, uint32_t activeProp,
+                           uint32_t modeBlob, uint32_t wbConnId, uint32_t wbCrtcProp) {
+            m_SinkCrtcId = crtcId;
+            m_SinkModeProp = modeProp;
+            m_SinkActiveProp = activeProp;
+            m_SinkModeBlob = modeBlob;
+            m_SinkWbConnId = wbConnId;
+            m_SinkWbCrtcProp = wbCrtcProp;
+        }
+
+        void sinkAddState(bool active) {
+            if (m_SinkCrtcId == 0) {
+                return;
+            }
+            set(m_SinkCrtcId, DRM_MODE_OBJECT_CRTC, m_SinkModeProp, active ? m_SinkModeBlob : 0);
+            set(m_SinkCrtcId, DRM_MODE_OBJECT_CRTC, m_SinkActiveProp, active ? 1 : 0);
+            set(m_SinkWbConnId, DRM_MODE_OBJECT_CONNECTOR, m_SinkWbCrtcProp,
+                active ? m_SinkCrtcId : 0);
+        }
 
         DrmPropertySetter(const DrmPropertySetter &) = delete;
         DrmPropertySetter(DrmPropertySetter &&) = delete;
@@ -600,6 +636,7 @@ class DrmRenderer : public IFFmpegRenderer {
             ret = ret && set(*plane.property("SRC_H"), srcH, false);
 
             if (ret) {
+                sinkAddState(true);
                 SDL_assert(m_AtomicReq);
                 int err = drmModeAtomicCommit(m_Fd, m_AtomicReq,
                                               DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET,
@@ -792,7 +829,8 @@ class DrmRenderer : public IFFmpegRenderer {
             m_WbArmed = true;
         }
 
-        // Wait for the capture and read the frame index out of it.
+        // Hand a landed capture to wbPoll(); see m_WbPending for why this no
+        // longer waits for the fence here.
         void wbHarvest(bool commitOk) {
             if (!m_WbArmed) {
                 return;
@@ -810,16 +848,51 @@ class DrmRenderer : public IFFmpegRenderer {
                 }
                 return;
             }
+            m_WbPending = true;
+            wbPoll(0);
+        }
+
+        // Read a pending capture once its frame has been scanned out.
+        // timeoutMs 0 is the per-commit check; a caller tearing down passes a
+        // real timeout and gives up on a fence that never signals.
+        void wbPoll(int timeoutMs) {
+            if (!m_WbPending) {
+                return;
+            }
             if (m_WbFence >= 0) {
                 struct pollfd pfd = { m_WbFence, POLLIN, 0 };
-                poll(&pfd, 1, 100);
+                if (poll(&pfd, 1, timeoutMs) <= 0) {
+                    if (timeoutMs == 0) {
+                        return;
+                    }
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Writeback fence never signalled; capture dropped");
+                    close(m_WbFence);
+                    m_WbFence = -1;
+                    m_WbPending = false;
+                    return;
+                }
                 close(m_WbFence);
                 m_WbFence = -1;
             }
+            m_WbPending = false;
+            uint64_t now = LiGetMicroseconds();
             long idx = fbcDecode(m_WbMap, (int)m_WbPitch, (int)m_WbW, (int)m_WbH, 1);
             if (idx >= 0) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEWB,%llu,%ld",
-                            (unsigned long long)LiGetMicroseconds(), idx);
+                            (unsigned long long)now, idx);
+            }
+            // The same barcode at the BOTTOM of the frame, painted only by
+            // sources that opt in (synthd --tear-strip). Scanout reads top to
+            // bottom, so a capture whose two strips disagree mixed two frames:
+            // that is a TEAR, and it is the only direct evidence of one.
+            // Separate line so ML-FRAMEWB's two-field format is unchanged.
+            int strip = fbc_strip_h((int)m_WbH);
+            long bottom = fbcDecode(m_WbMap + (size_t)((int)m_WbH - strip) * m_WbPitch,
+                                    (int)m_WbPitch, (int)m_WbW, (int)m_WbH, 1);
+            if (bottom >= 0) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ML-FRAMEWB-TEAR,%llu,%ld,%ld",
+                            (unsigned long long)now, idx, bottom);
             }
         }
 
@@ -833,13 +906,15 @@ class DrmRenderer : public IFFmpegRenderer {
             if (!m_WbWanted || m_WbFailed) {
                 return false;
             }
-            return (++m_WbCounter % m_WbInterval) == 0;
+            return (++m_WbCounter % m_WbInterval) == 0 && !m_WbPending;
         }
 
         bool apply() {
             if (!m_Atomic) {
                 return true;
             }
+
+            wbPoll(0);
 
             drmModeAtomicReqPtr req = nullptr;
             std::unordered_map<uint32_t, PlaneBuffer> pendingBuffers;
@@ -1042,6 +1117,7 @@ private:
     void enterOverlayCompositionMode();
     void blitOverlayToCompositionSurface(Overlay::OverlayType type, SDL_Surface* newSurface, SDL_Rect* overlayRect);
     static bool drmFormatMatchesVideoFormat(uint32_t drmFormat, int videoFormat);
+    bool initializeSink();
 
     IFFmpegRenderer* m_BackendRenderer;
     SDL_Window* m_Window;
@@ -1071,6 +1147,11 @@ private:
     uint32_t m_HdrOutputMetadataBlobId;
     SDL_Rect m_OutputRect;
     std::set<uint32_t> m_SupportedVideoPlaneFormats;
+
+    // MOONLIGHT_WB_SINK: see initializeSink().
+    bool m_Sink;
+    drmModeModeInfo m_SinkMode;
+    uint32_t m_SinkModeBlob;
 
     static constexpr int k_SwFrameCount = 2;
     SwFrameMapper m_SwFrameMapper;

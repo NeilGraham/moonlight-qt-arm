@@ -212,6 +212,20 @@ NvHTTP::startApp(QString verb,
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
 
+    // retro-stream capabilities (Sunshine-ARM video::rs_cap_e): bit 0 says
+    // this client decodes and displays a mid-stream resolution change, so a
+    // retro-stream host may encode the console's own resolution (capped by the
+    // one requested here) and follow it live. The renderers already rebuild
+    // on a frame-size change and hevc_rkmpp re-allocates on the new SPS.
+    // A fork-private launch argument: stock hosts ignore unknown arguments,
+    // and upstream's own feature flags can never collide with it.
+    // MOONLIGHT_RS_DYNAMIC_RES=0 declares nothing (the stream then stays at
+    // the requested resolution).
+    int rsCaps = 0;
+    if (!isGfe && qgetenv("MOONLIGHT_RS_DYNAMIC_RES") != "0") {
+        rsCaps |= 1;
+    }
+
     QString response =
             openConnectionToString(m_BaseUrlHttps,
                                    verb,
@@ -234,6 +248,7 @@ NvHTTP::startApp(QString verb,
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   (rsCaps ? "&rsCaps="+QString::number(rsCaps) : QString())+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 

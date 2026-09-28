@@ -126,6 +126,10 @@ private:
     int m_StreamFps;
     int m_OriginalVideoWidth;
     int m_OriginalVideoHeight;
+    // Size of the last decoded frame: a retro-stream host follows the
+    // console's own resolution mid-stream (rsCaps in NvHTTP::startApp).
+    int m_LastDecodedWidth = 0;
+    int m_LastDecodedHeight = 0;
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
     bool m_TestOnly;
