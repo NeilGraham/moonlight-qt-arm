@@ -140,6 +140,34 @@ void StreamUtils::scaleSourceToDestinationSurface(SDL_Rect* src, SDL_Rect* dst)
     }
 }
 
+// Whole-number display scaling (retro-stream). A retro-stream host sends a
+// console picture below 720 lines already scaled up by a whole number, and
+// sizes it so that another whole number finishes the job on this screen
+// (480p on a 4K TV: 960 lines from the host, 2x here). Drawn at that whole
+// multiple, every console pixel covers the same number of screen pixels —
+// even widths, no shimmer when the picture scrolls — and a picture the host
+// already sized for this screen (960 lines on a 1080-line TV) is shown 1:1
+// instead of softened by a 1.125x stretch. The rest of the screen is black.
+// Taken only when it costs at most 15% of the fitted height, so an ordinary
+// 1080p stream on a 1440p screen (75%) still fills it.
+bool StreamUtils::integerScaleSourceToDestinationSurface(SDL_Rect* src, SDL_Rect* dst)
+{
+    SDL_Rect fit = *dst;
+    scaleSourceToDestinationSurface(src, &fit);
+
+    int k = SDL_min(dst->w / src->w, dst->h / src->h);
+    if (k < 1 || k * src->h >= fit.h || k * src->h * 100 < fit.h * 85) {
+        *dst = fit;
+        return false;
+    }
+
+    dst->x += (dst->w - k * src->w) / 2;
+    dst->y += (dst->h - k * src->h) / 2;
+    dst->w = k * src->w;
+    dst->h = k * src->h;
+    return true;
+}
+
 void StreamUtils::screenSpaceToNormalizedDeviceCoords(SDL_FRect* rect, int viewportWidth, int viewportHeight)
 {
     rect->x = (rect->x / (viewportWidth / 2.0f)) - 1.0f;
